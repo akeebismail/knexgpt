@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knexgpt-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: knexgpt
+  template:
+    metadata:
+      labels:
+        app: knexgpt
+    spec:
+      containers:
+      - name: knexgpt
+        image: knexgpt:latest
+        ports:
+        - containerPort: 8000 

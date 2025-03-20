@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "knexgpt"
+version = "0.1.0"
+description = "Multi-agent knowledge graph system with AI-driven querying and data processing"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+rdflib = "^7.0.0"
+neo4j = "^5.14.0"
+fastapi = "^0.109.0"
+uvicorn = "^0.27.0"
+pydantic = "^2.6.0"
+metagpt = "^0.7.0"
+langchain = "^0.1.0"
+transformers = "^4.36.0"
+torch = "^2.1.0"
+owlready2 = "^0.45"
+aiohttp = "^3.9.0"
+asyncio = "^3.4.3"
+python-dotenv = "^1.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+black = "^24.1.0"
+isort = "^5.13.0"
+mypy = "^1.8.0"
+pytest-asyncio = "^0.23.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3 
