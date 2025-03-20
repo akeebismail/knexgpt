@@ -14,7 +14,7 @@ This project is a multi-agent knowledge graph system that integrates various gra
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/your-repo.git
+   git clone https://github.com/akeebismail/knexgpt.git
    cd your-repo
    ```
 
