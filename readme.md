@@ -152,7 +152,7 @@ Every concrete agent constructs `knexgpt.communication.message_queue.MessageQueu
 
 Nothing in the repository calls `start_listening()`. The listeners therefore do not run unless some other program constructs the agents and calls that method.
 
-`perform_task` on the extraction agent, executed with a stubbed Pika connection and a stubbed database factory, raises `NameError: name 'GraphQuery' is not defined` after reading the input and translating a fixed SPARQL string. `GraphQuery` is defined in `knexgpt/db/adapter.py` and is not imported in `knexgpt/agents/data_extraction.py`. `send_message` is below that line, so the broker publish does not happen. **Verified.**
+`data_extraction.py` imports `GraphQuery` from `knexgpt.db.adapter`. That import was added in `bd2771e` after the audit run. The run itself used the previous file, which did not import the name. With a stubbed Pika connection and a stubbed database factory, `perform_task` on that file raised `NameError: name 'GraphQuery' is not defined` after reading the input and translating a fixed SPARQL string, so `execute_query` and `send_message` were not reached. **Verified** on the pre-fix source. The current file binds `GraphQuery` and calls `execute_query` before publishing. That later path was not re-executed: importing the module still fails because `adapter_factory.py` imports the missing `knexgpt.db.neo4j_adapter`.
 
 ```mermaid
 sequenceDiagram
@@ -160,13 +160,16 @@ sequenceDiagram
   participant Agent as DataExtractionAgent.perform_task
   participant Files as extract_data
   participant Tr as QueryTranslator
+  participant DB as adapter.execute_query
   Caller->>Agent: perform_task(data_source)
   Agent->>Files: extract_data(data_source)
   Files-->>Agent: dict or list
   Agent->>Tr: translate("SELECT ?s WHERE { ?s ?p ?o }", "cypher")
   Tr-->>Agent: "MATCH  ?s ?p ?o  RETURN ?s"
-  Agent--xAgent: NameError, GraphQuery is not defined
-  Note over Agent: adapter.execute_query and send_message are not reached
+  Note over Agent: Audit run, before bd2771e, raised NameError here
+  Agent->>DB: GraphQuery of the translated string
+  DB-->>Agent: GraphResult
+  Agent->>Agent: send_message on queue data_extraction
 ```
 
 ### Queue names
@@ -184,7 +187,7 @@ flowchart LR
   val -->|"publish task process_query<br/>routing key validation"| val
 ```
 
-The publish from `DataExtractionAgent` is additionally unreachable because of the `NameError` above. The other three publishes were executed against the stub.
+The extraction publish was not observed. The audit hit `NameError` on the pre-`bd2771e` file, and the current module still cannot be imported. The other three publishes were executed against the stub.
 
 `QueryProcessingAgent.perform_task` expects a string. `ValidationAgent` puts a dict in the `data` field. `handle_message` on the query agent would pass that dict through if a message ever arrived on `query_processing`. The query agent does not publish a follow-up message. **Inspected** from `query_processing.py`, and the validation publish payload was **verified**.
 
@@ -290,7 +293,7 @@ The same query in lower case returns the defaults `MATCH (n) RETURN n` and `g.V(
 
 `process_json_output` reads `status`, `data.text`, and `data.metadata` (`title`, `author`, `pages`, `keywords`). A non-success status returns `{}`. **Verified** for one success object and one failure object. No other method in the repository calls it.
 
-`perform_task` is the `NameError` path in the sequence diagram. The SPARQL string is constant; it does not depend on the file that was read.
+`perform_task` always translates the constant SPARQL string `SELECT ?s WHERE { ?s ?p ?o }`. On the current source it passes that string to `adapter.execute_query`. The audit run used the previous revision and raised `NameError` before the query or the publish. The SPARQL text does not depend on the file that was read.
 
 ### `knexgpt/agents/data_enrichment.py`
 
@@ -461,7 +464,7 @@ The application reads no environment file and has no settings module. `python-do
 
 - The HTTP service does not read or write a knowledge graph. Context is a fixed string, and the translation result is discarded.
 - The generation model id `gpt-2` was not found on the Hugging Face Hub. The translation model that does resolve translates between English and Welsh (`cy`), which is a different task from emitting Cypher.
-- Agent classes do not form a pipeline. They publish to their own queues, three of the four task methods are placeholders, and the extraction task raises `NameError` before it can publish or query.
+- Agent classes do not form a pipeline. They publish to their own queues, and three of the four task methods are placeholders. Importing the extraction agent still fails because `adapter_factory.py` imports a missing module. The audit run, on the file from before `bd2771e`, raised `NameError` for `GraphQuery`. That name is now imported.
 - `adapter_factory.py` imports a module that is not in the tree, so the extraction agent cannot be imported.
 - ArangoDB and Neptune adapters do not match the async or future-based clients they call.
 - `QueryTranslator` is a case-sensitive string split, not a query compiler.

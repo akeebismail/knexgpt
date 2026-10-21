@@ -24,7 +24,8 @@ Labels:
 | --- | --- |
 | Host Python | CPython 3.11.7 (`/usr/local/bin/python3`) |
 | Audit virtualenv | `/tmp/knexgpt-audit-venv` (not part of the repository) |
-| Repository HEAD | `4be0a49b187256ab70f2d25e842fc68de798f1a5` (`repo name`), parent `f74806407d4154e8a3a61e90bd63544f5e3a4ee3` (`knexgpt ontology agent`) |
+| Repository at audit time | `4be0a49b187256ab70f2d25e842fc68de798f1a5` (`repo name`), parent `f74806407d4154e8a3a61e90bd63544f5e3a4ee3` (`knexgpt ontology agent`) |
+| Integrated before push | `origin/main` had moved to `6a3736b` (merge of `bd2771e`, which imports `GraphQuery`). The documentation commit was rebased onto that history. |
 | Remote | `git@github.com:akeebismail/knexgpt.git` |
 | Working tree | `knexgpt/data_processing/chunkr_integration.py` modified, unstaged |
 | Poetry | `poetry check` prints `All set!` |
@@ -200,7 +201,7 @@ Pika was replaced in `sys.modules` by a connection that records `basic_publish`.
 
 Queue names on the constructed objects: `data_extraction`, `data_enrichment`, `validation`, `query_processing`.
 
-`DataExtractionAgent.perform_task({"a": 1})` raises `NameError: name 'GraphQuery' is not defined`. The publish list stays empty.
+`DataExtractionAgent.perform_task({"a": 1})` raised `NameError: name 'GraphQuery' is not defined` on the file audited before `bd2771e`. The publish list stayed empty. That commit, now on `main`, adds `from knexgpt.db.adapter import GraphQuery`. The `NameError` was not re-run against the updated file. Importing `knexgpt.agents.data_extraction` still fails first, on the missing `knexgpt.db.neo4j_adapter` module.
 
 `extract_data` results: a dict is returned as itself; a `.json` file loads as a dict; a `.csv` file returns a `list` (`[{'name': 'Ada', 'age': '36'}]`); a `.txt` file returns `{"text": "hello text"}`; a missing path returns `{}`.
 
@@ -285,7 +286,7 @@ Wheel inspected, not installed. It contains a top-level `asyncio` package (Tulip
 2. **Translation model is English to Welsh.** `nl_to_cypher.py` loads `Helsinki-NLP/opus-mt-en-cy`. The API discards the result anyway (`cypher_query` is unused). The name of the class and of the local variable describe a different task.
 3. **Fixed retrieval context.** `app.py` sets `context = "Sample context from the knowledge graph."` and the comment says this is mocked. `RAG` does not query a graph.
 4. **Extraction agent cannot be imported.** `adapter_factory.py` line 1 imports `knexgpt.db.neo4j_adapter`. There is no such file. `Neo4jAdapter` lives in `knexgpt/db/adapter.py`.
-5. **`GraphQuery` is unbound.** Even with the factory stubbed, `perform_task` raises `NameError` before `execute_query` and before `send_message`.
+5. **`GraphQuery` was unbound during the audit.** With the factory stubbed, `perform_task` raised `NameError` before `execute_query` and before `send_message`. Commit `bd2771e` (`Fix missing GraphQuery import in DataExtractionAgent`), merged as `6a3736b`, adds the import. The updated `perform_task` was not executed. Issue 4 still prevents importing the module.
 6. **Agent queues do not meet.** Publishers and consumers use the routing keys in the table above. A message published by one agent is not on the queue the next agent consumes. `start_listening` is never called.
 7. **RabbitMQ at construction.** `MessageQueueClient.__init__` opens Pika immediately. With no broker, agent construction raises `AMQPConnectionError`.
 8. **ArangoDB client misuse.** Construction requires a running loop, `db()` is not awaited, and `close()` is not awaited. Against a closed port, a manually corrected `db()` then fails with `ClientConnectorError`.
