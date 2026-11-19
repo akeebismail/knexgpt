@@ -2,7 +2,7 @@
 name = "knexgpt"
 version = "0.1.0"
 description = "Multi-agent knowledge graph system with AI-driven querying and data processing"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Your Name <[REDACTED_EMAIL]>"]
 
 [tool.poetry.dependencies]
 python = "^3.9"

@@ -365,10 +365,10 @@ Dev dependencies `pytest`, `pytest-asyncio`, `black`, `isort`, and `mypy` are de
 
 ## Setup
 
-The previous README told readers to clone the repository, `cd your-repo`, and run `pip install -r requirements.txt`. `requirements.txt` is not in the repository. The git remote is `git@github.com:akeebismail/knexgpt.git`, so a clone directory is typically `knexgpt`, and the Poetry project lives at that checkout root.
+The previous README told readers to clone the repository, `cd your-repo`, and run `pip install -r requirements.txt`. `requirements.txt` is not in the repository. The git remote is `[REDACTED_EMAIL]:akeebismail/knexgpt.git`, so a clone directory is typically `knexgpt`, and the Poetry project lives at that checkout root.
 
 ```bash
-git clone git@github.com:akeebismail/knexgpt.git
+git clone [REDACTED_EMAIL]:akeebismail/knexgpt.git
 cd knexgpt
 python -m venv .venv
 source .venv/bin/activate
@@ -472,7 +472,7 @@ The application reads no environment file and has no settings module. `python-do
 - Firecrawl, Chunkr, the preprocessor, Kafka, and Redis are unused by the entry point. The Chunkr wrapper does not match `chunkr-ai` 0.3.7.
 - `metagpt` and `langchain` are unused declarations. The PyPI `asyncio` dependency can shadow the standard library if it is installed.
 - Docker and Kubernetes manifests do not form a deployable service: the image install file is missing, and the manifest has no Service.
-- The README that this file replaces stated support for RDF/OWL management, three graph databases, natural-language RAG over the graph, and an MIT license. The license claim has no `LICENSE` file and no license field in `pyproject.toml`. The repository does not establish a license. The author field in `pyproject.toml` is the placeholder `Your Name <your.email@example.com>`.
+- The README that this file replaces stated support for RDF/OWL management, three graph databases, natural-language RAG over the graph, and an MIT license. The license claim has no `LICENSE` file and no license field in `pyproject.toml`. The repository does not establish a license. The author field in `pyproject.toml` is the placeholder `Your Name <[REDACTED_EMAIL]>`.
 
 ## Further detail
 
