@@ -1,0 +1,2872 @@
+import json
+import time
+from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union
+from uuid import uuid4
+
+from packaging import version as packaging_version
+
+if TYPE_CHECKING:
+    from agno.tracing.schemas import Span, Trace
+
+from agno.db.base import BaseDb, SessionType
+from agno.db.gcs_json.utils import apply_sorting
+from agno.db.migrations.manager import MigrationManager
+from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
+from agno.db.schemas.knowledge import KnowledgeRow
+from agno.db.schemas.memory import UserMemory
+from agno.db.utils import (
+    AGGREGATE_METRICS_COUNT_COLUMNS,
+    AGGREGATE_METRICS_KEY_COLUMNS,
+    COMPONENT_METRICS_KEY_COLUMNS,
+    METRICS_LOCK_SECONDS,
+    METRICS_REFRESH_ID,
+    METRICS_STOPPED_ERROR,
+    METRICS_WRITE_RETRIES,
+    build_metrics_by_owner_from_rows,
+    build_metrics_from_aggregate_metrics,
+    build_single_run_row,
+    calculate_date_metrics,
+    calculate_month_metrics,
+    database_error_message,
+    deserialize_metrics_rows,
+    deserialize_run,
+    deserialize_session,
+    deserialize_sessions,
+    drop_legacy_metrics,
+    filter_context_runs,
+    get_metrics_dates_to_calculate,
+    get_metrics_legacy_runs,
+    get_metrics_records_by_day,
+    get_metrics_reopen_session_ids,
+    get_metrics_rows_by_key,
+    get_months_to_calculate_metrics_for,
+    get_open_metrics_months,
+    list_metrics_totals_models,
+    merge_metrics_totals,
+    merge_runs_table_with_legacy_blob,
+    metrics_day_completed,
+    metrics_day_to_reopen,
+    metrics_full_months,
+    metrics_month_end,
+    metrics_refresh_status,
+    metrics_versions,
+    reopen_metrics_days_from,
+    reopen_metrics_month,
+    reopened_aggregate_metrics_row,
+    resolve_metrics_fields,
+    total_metrics_rows,
+    write_aggregate_metrics_rows,
+)
+from agno.run.agent import RunOutput
+from agno.run.base import RunStatus
+from agno.run.team import TeamRunOutput
+from agno.run.workflow import WorkflowRunOutput
+from agno.session import AgentSession, Session, TeamSession, WorkflowSession
+from agno.utils.log import log_debug, log_error, log_info, log_warning
+from agno.utils.string import generate_id
+
+try:
+    from google.cloud import storage as gcs  # type: ignore
+except ImportError:
+    raise ImportError("`google-cloud-storage` not installed. Please install it with `pip install google-cloud-storage`")
+
+
+class GcsJsonDb(BaseDb):
+    def __init__(
+        self,
+        bucket_name: str,
+        prefix: Optional[str] = None,
+        session_table: Optional[str] = None,
+        runs_table: Optional[str] = None,
+        memory_table: Optional[str] = None,
+        metrics_table: Optional[str] = None,
+        component_metrics_table: Optional[str] = None,
+        aggregate_metrics_table: Optional[str] = None,
+        metrics_refreshes_table: Optional[str] = None,
+        eval_table: Optional[str] = None,
+        knowledge_table: Optional[str] = None,
+        traces_table: Optional[str] = None,
+        spans_table: Optional[str] = None,
+        project: Optional[str] = None,
+        credentials: Optional[Any] = None,
+        id: Optional[str] = None,
+    ):
+        """
+        Interface for interacting with JSON files stored in Google Cloud Storage as database.
+
+        Args:
+            bucket_name (str): Name of the GCS bucket where JSON files will be stored.
+            prefix (Optional[str]): Path prefix for organizing files in the bucket. Defaults to "agno/".
+            session_table (Optional[str]): Name of the JSON file to store sessions (without .json extension).
+            runs_table (Optional[str]): Name of the JSON file to store runs (one entry per run).
+            memory_table (Optional[str]): Name of the JSON file to store user memories.
+            metrics_table (Optional[str]): Name of the JSON file to store metrics.
+            component_metrics_table (Optional[str]): Name of the JSON file to store the metrics of each agent, team
+                and workflow.
+            aggregate_metrics_table (Optional[str]): Name of the JSON file to store the metrics of each user.
+            metrics_refreshes_table (Optional[str]): Name of the JSON file to store the metrics refreshes.
+            eval_table (Optional[str]): Name of the JSON file to store evaluation runs.
+            knowledge_table (Optional[str]): Name of the JSON file to store knowledge content.
+            traces_table (Optional[str]): Name of the JSON file to store traces.
+            spans_table (Optional[str]): Name of the JSON file to store spans.
+            project (Optional[str]): GCP project ID. If None, uses default project.
+            credentials (Optional[Any]): GCP credentials. If None, uses default credentials.
+            id (Optional[str]): ID of the database.
+        """
+        if id is None:
+            prefix_suffix = prefix or "agno/"
+            seed = f"{bucket_name}_{project}#{prefix_suffix}"
+            id = generate_id(seed)
+
+        super().__init__(
+            id=id,
+            session_table=session_table,
+            runs_table=runs_table,
+            memory_table=memory_table,
+            metrics_table=metrics_table,
+            component_metrics_table=component_metrics_table,
+            aggregate_metrics_table=aggregate_metrics_table,
+            metrics_refreshes_table=metrics_refreshes_table,
+            eval_table=eval_table,
+            knowledge_table=knowledge_table,
+            traces_table=traces_table,
+            spans_table=spans_table,
+        )
+
+        self.bucket_name = bucket_name
+        self.prefix = prefix or "agno/"
+        if self.prefix and not self.prefix.endswith("/"):
+            self.prefix += "/"
+
+        # Initialize GCS client and bucket
+        self.client = gcs.Client(project=project, credentials=credentials)
+        self.bucket = self.client.bucket(self.bucket_name)
+
+        if metrics_table is not None:
+            log_warning("metrics_table is deprecated; use component_metrics_table and aggregate_metrics_table.")
+
+        # Reads warn once that the deprecated metrics file is served until a first calculate_metrics has finished
+        self._deprecated_metrics_logged: bool = False
+        # The days whose metrics a write could not reopen, retried by the next write
+        self._metrics_days_not_reopened: Set[date] = set()
+
+    def table_exists(self, table_name: str) -> bool:
+        """JSON implementation, always returns True."""
+        return True
+
+    def _get_blob_name(self, filename: str) -> str:
+        """Get the full blob name including prefix for a given filename."""
+        return f"{self.prefix}{filename}.json"
+
+    def _read_json_file(
+        self, filename: str, create_table_if_not_found: Optional[bool] = False, blob: Optional[Any] = None
+    ) -> List[Dict[str, Any]]:
+        """Read data from a JSON file in GCS, creating it if it doesn't exist.
+
+        Args:
+            filename (str): The name of the JSON file to read.
+            blob (Optional[Any]): The blob to read it through, which keeps the generation read. A new one when None.
+
+        Returns:
+            List[Dict[str, Any]]: The data from the JSON file.
+
+        Raises:
+            google.cloud.exceptions.GoogleCloudError: On any GCS read failure
+                other than "file not found" (permission denied, quota, network).
+                Do not silently swallow — a swallowed read returns [] and the
+                caller believes the table is empty when it isn't.
+        """
+        from google.cloud.exceptions import NotFound  # type: ignore[import-untyped]
+
+        blob_name = self._get_blob_name(filename)
+        if blob is None:
+            blob = self.bucket.blob(blob_name)
+
+        try:
+            data_str = blob.download_as_bytes().decode("utf-8")
+        except NotFound:
+            if create_table_if_not_found:
+                log_debug(f"Creating new GCS JSON file: {blob_name}")
+                blob.upload_from_string("[]", content_type="application/json")
+                # Store the schema version for the created sessions table, which holds no legacy runs for metrics
+                if filename == self.session_table_name:
+                    latest_schema_version = MigrationManager(self).latest_schema_version
+                    self.upsert_schema_version(table_name=filename, version=latest_schema_version.public)
+            return []
+        except Exception as e:
+            # Any other GCS error (auth, network, quota) must propagate — a
+            # silent empty-list return corrupts the caller's view of state.
+            log_error(f"Error reading the {blob_name} JSON file from GCS: {str(e)}")
+            raise
+
+        try:
+            return json.loads(data_str)
+        except json.JSONDecodeError:
+            log_error(f"Malformed JSON in GCS blob {blob_name}")
+            raise
+
+    def _read_json_file_with_generation(
+        self, filename: str, create_table_if_not_found: Optional[bool] = False
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Read data from a JSON file in GCS, as _read_json_file does, with the generation of the file it read.
+
+        Args:
+            filename (str): The name of the JSON file to read.
+
+        Returns:
+            Tuple[List[Dict[str, Any]], int]: The data from the JSON file, and its generation. 0 while it does not
+                exist.
+        """
+        blob = self.bucket.blob(self._get_blob_name(filename))
+        return self._read_json_file(filename, create_table_if_not_found, blob=blob), blob.generation or 0
+
+    def _write_json_file(
+        self,
+        filename: str,
+        data: List[Dict[str, Any]],
+        if_generation_match: Optional[int] = None,
+        indent: Optional[int] = 2,
+    ) -> None:
+        """Write data to a JSON file in GCS.
+
+        Args:
+            filename (str): The name of the JSON file to write.
+            data (List[Dict[str, Any]]): The data to write to the JSON file.
+            if_generation_match (Optional[int]): Write only while the file is still at this generation, from
+                _read_json_file_with_generation. 0 matches a file that does not exist.
+            indent (Optional[int]): The indent of the JSON. None for the most compact, as the metrics files are
+                written: only this class reads them, and indenting a large file takes most of its write.
+
+        Raises:
+            google.cloud.exceptions.PreconditionFailed: If the file is no longer at if_generation_match.
+            Exception: If an error occurs while writing to the JSON file.
+        """
+        from google.cloud.exceptions import PreconditionFailed  # type: ignore[import-untyped]
+
+        blob_name = self._get_blob_name(filename)
+        blob = self.bucket.blob(blob_name)
+
+        try:
+            json_data = json.dumps(data, indent=indent, default=str)
+            blob.upload_from_string(json_data, content_type="application/json", if_generation_match=if_generation_match)
+
+        except PreconditionFailed:
+            # Written by another process since it was read: the caller reads it again
+            raise
+        except Exception as e:
+            # Do NOT swallow: silent write failures make the caller believe
+            # the data landed when it didn't (misconfigured credentials, GCS
+            # outage, quota exhausted, etc). Log then propagate.
+            log_error(f"Error writing to the {blob_name} JSON file in GCS: {str(e)}")
+            raise
+
+    def get_latest_schema_version(self, table_name: str = "") -> Optional[str]:
+        """Get the schema version stamped for the given table.
+
+        Defaults to "2.0.0" when nothing is stamped so the MigrationManager
+        runs migrations instead of skipping the table.
+        """
+        rows = self._read_json_file(self.versions_table_name, create_table_if_not_found=True)
+        for row in rows:
+            if row.get("table_name") == table_name:
+                return row.get("version") or "2.0.0"
+        return "2.0.0"
+
+    def upsert_schema_version(self, table_name: str = "", version: str = "") -> None:
+        """Record the schema version stamp for the given table."""
+        rows = self._read_json_file(self.versions_table_name, create_table_if_not_found=True)
+        entry = {"table_name": table_name, "version": version, "updated_at": int(time.time())}
+        rows = [row for row in rows if row.get("table_name") != table_name]
+        rows.append(entry)
+        self._write_json_file(self.versions_table_name, rows)
+
+    # -- Run methods --
+
+    def _read_runs_file(self, create_table_if_not_found: Optional[bool] = True) -> List[Dict[str, Any]]:
+        return self._read_json_file(self.runs_table_name, create_table_if_not_found=create_table_if_not_found)
+
+    def _write_runs_file(self, rows: List[Dict[str, Any]]) -> None:
+        self._write_json_file(self.runs_table_name, rows)
+
+    def _get_session_runs_data(self, session_id: str) -> List[Dict[str, Any]]:
+        all_runs = self._read_runs_file(create_table_if_not_found=False)
+        rows = [r for r in all_runs if r.get("session_id") == session_id]
+        rows.sort(key=lambda r: (r.get("run_index") or 0, r.get("created_at") or 0))
+        return [r["run_data"] for r in rows if "run_data" in r]
+
+    def _get_sessions_runs(self, session_ids: List[str]) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+        """Run dicts for several sessions in one read, used by the search fallback."""
+        return self._get_sessions_runs_data(session_ids)
+
+    def _get_sessions_runs_data(self, session_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        if not session_ids:
+            return {}
+        all_runs = self._read_runs_file(create_table_if_not_found=False)
+        wanted = set(session_ids)
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for r in all_runs:
+            sid = r.get("session_id")
+            if sid in wanted and "run_data" in r:
+                grouped.setdefault(sid, []).append(r)
+        for sid, items in grouped.items():
+            items.sort(key=lambda r: (r.get("run_index") or 0, r.get("created_at") or 0))
+            grouped[sid] = [it["run_data"] for it in items]
+        return grouped  # type: ignore[return-value]
+
+    def upsert_run(
+        self,
+        run: Union[RunOutput, TeamRunOutput, WorkflowRunOutput, Dict[str, Any]],
+        session_id: str,
+        user_id: Optional[str] = None,
+        run_index: Optional[int] = None,
+    ) -> None:
+        """Upsert a single run row in the runs file on GCS.
+
+        Optimized for updating existing runs (e.g., status changes in HITL or
+        background mode) without re-upserting all runs in the session.
+
+        For new runs, ``run_index`` should be provided or will be read from
+        ``run_data``. For updates to existing runs, ``run_index`` is preserved
+        from the original insert.
+
+        Args:
+            run: The run object or dictionary to upsert.
+            session_id: The session ID this run belongs to.
+            user_id: Optional user ID to associate with the run.
+            run_index: Optional run index for new runs.
+
+        Raises:
+            ValueError: If the run has no run_id.
+            Exception: If an error occurs during upsert.
+        """
+        try:
+            row = build_single_run_row(
+                run=run,
+                session_id=session_id,
+                user_id=user_id,
+                run_index=run_index,
+            )
+
+            existing = self._read_runs_file(create_table_if_not_found=True)
+            replaced = False
+            for i, r in enumerate(existing):
+                if r.get("run_id") == row["run_id"]:
+                    row["run_index"] = r.get("run_index", row.get("run_index"))
+                    # The stored created_at, which a resumed run keeps
+                    if r.get("created_at") is not None:
+                        row["created_at"] = r["created_at"]
+                    existing[i] = row
+                    replaced = True
+                    break
+            if not replaced:
+                existing.append(row)
+            self._write_runs_file(existing)
+            self._reopen_metrics_days([row["created_at"]])
+        except Exception as e:
+            log_error(f"Exception upserting run into runs file: {str(e)}")
+            raise e
+
+    def _delete_session_runs(self, session_id: str) -> int:
+        existing = self._read_runs_file(create_table_if_not_found=False)
+        kept = [r for r in existing if r.get("session_id") != session_id]
+        deleted = len(existing) - len(kept)
+        if deleted:
+            self._write_runs_file(kept)
+        return deleted
+
+    def cleanup_legacy_runs_field(self, force: bool = False) -> bool:
+        """Unset the legacy ``runs`` field from session records.
+
+        See :meth:`JsonDb.cleanup_legacy_runs_field` for the contract.
+        """
+        sessions = self._read_json_file(self.session_table_name, create_table_if_not_found=False)
+        if not sessions:
+            return False
+
+        if not force:
+            pending = sum(1 for s in sessions if s.get("runs"))
+            if pending > 0:
+                raise RuntimeError(
+                    f"Refusing to unset {self.session_table_name}.runs: {pending} session(s) still have "
+                    "non-null `runs` content. Run MigrationManager(db).up() first, or pass force=True."
+                )
+
+        touched = 0
+        for s in sessions:
+            if "runs" in s:
+                s.pop("runs", None)
+                touched += 1
+        if touched:
+            self._write_json_file(self.session_table_name, sessions)
+        log_info(f"Unset runs on {touched} session record(s)")
+        return touched > 0
+
+    def get_run(
+        self, run_id: str, deserialize: Optional[bool] = True
+    ) -> Optional[Union[RunOutput, TeamRunOutput, WorkflowRunOutput, Dict[str, Any]]]:
+        try:
+            for r in self._read_runs_file(create_table_if_not_found=False):
+                if r.get("run_id") == run_id:
+                    if not deserialize:
+                        return r
+                    return deserialize_run(r.get("run_type"), r["run_data"])
+            return None
+        except Exception as e:
+            log_error(f"Exception reading run: {str(e)}")
+            raise e
+
+    def get_runs(
+        self,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        status: Optional[RunStatus] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Union[List[Union[RunOutput, TeamRunOutput, WorkflowRunOutput]], Tuple[List[Dict[str, Any]], int]]:
+        try:
+            rows = self._read_runs_file(create_table_if_not_found=False)
+            if session_id is not None:
+                rows = [r for r in rows if r.get("session_id") == session_id]
+            if user_id is not None:
+                rows = [r for r in rows if r.get("user_id") == user_id]
+            if agent_id is not None:
+                rows = [r for r in rows if r.get("agent_id") == agent_id]
+            if team_id is not None:
+                rows = [r for r in rows if r.get("team_id") == team_id]
+            if workflow_id is not None:
+                rows = [r for r in rows if r.get("workflow_id") == workflow_id]
+            if status is not None:
+                status_value = status.value if isinstance(status, RunStatus) else status
+                rows = [r for r in rows if r.get("status") == status_value]
+
+            total_count = len(rows)
+
+            if sort_by is not None:
+                rows = apply_sorting(rows, sort_by, sort_order)
+            else:
+                rows = sorted(rows, key=lambda r: (r.get("run_index") or 0, r.get("created_at") or 0))
+
+            if limit is not None:
+                start = 0
+                if page is not None:
+                    start = (page - 1) * limit
+                rows = rows[start : start + limit]
+
+            if not deserialize:
+                return rows, total_count
+            return [deserialize_run(r.get("run_type"), r["run_data"]) for r in rows]
+        except Exception as e:
+            log_error(f"Exception reading runs: {str(e)}")
+            raise e
+
+    def _scrub_run_ids_from_legacy_blob(self, run_ids: set) -> None:
+        """Remove ``run_ids`` from every session's legacy ``runs`` field —
+        see ``JsonDb`` for the rationale."""
+        if not run_ids:
+            return
+        try:
+            sessions = self._read_json_file(self.session_table_name, create_table_if_not_found=False)
+        except Exception:
+            return
+        mutated = False
+        for s in sessions:
+            legacy = s.get("runs")
+            if not isinstance(legacy, list):
+                continue
+            kept = [r for r in legacy if not (isinstance(r, dict) and r.get("run_id") in run_ids)]
+            if len(kept) != len(legacy):
+                s["runs"] = kept
+                mutated = True
+        if mutated:
+            self._write_json_file(self.session_table_name, sessions)
+
+    def delete_run(self, run_id: str) -> bool:
+        try:
+            rows = self._read_runs_file(create_table_if_not_found=False)
+            kept = [r for r in rows if r.get("run_id") != run_id]
+            deleted = len(kept) != len(rows)
+            if deleted:
+                self._write_runs_file(kept)
+            self._scrub_run_ids_from_legacy_blob({run_id})
+            return deleted
+        except Exception as e:
+            log_error(f"Error deleting run: {str(e)}")
+            raise e
+
+    def delete_runs(self, run_ids: List[str]) -> None:
+        try:
+            rows = self._read_runs_file(create_table_if_not_found=False)
+            to_drop = set(run_ids)
+            kept = [r for r in rows if r.get("run_id") not in to_drop]
+            if len(kept) != len(rows):
+                self._write_runs_file(kept)
+            self._scrub_run_ids_from_legacy_blob(to_drop)
+        except Exception as e:
+            log_error(f"Error deleting runs: {str(e)}")
+            raise e
+
+    # -- Session methods --
+
+    def delete_session(self, session_id: str, user_id: Optional[str] = None) -> bool:
+        """Delete a session from the GCS JSON file.
+
+        Args:
+            session_id (str): The ID of the session to delete.
+            user_id (Optional[str]): User ID to filter by. Defaults to None.
+
+        Returns:
+            bool: True if the session was deleted, False otherwise.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+            original_count = len(sessions)
+            sessions = [
+                s
+                for s in sessions
+                if not (s.get("session_id") == session_id and (user_id is None or s.get("user_id") == user_id))
+            ]
+
+            if len(sessions) < original_count:
+                self._write_json_file(self.session_table_name, sessions)
+                # Cascade-delete runs
+                self._delete_session_runs(session_id)
+                log_debug(f"Successfully deleted session with session_id: {session_id}")
+                return True
+
+            else:
+                log_debug(f"No session found to delete with session_id: {session_id}")
+                return False
+
+        except Exception as e:
+            log_warning(f"Error deleting session: {str(e)}")
+            raise e
+
+    def delete_sessions(self, session_ids: List[str], user_id: Optional[str] = None) -> None:
+        """Delete multiple sessions from the GCS JSON file.
+
+        Args:
+            session_ids (List[str]): The IDs of the sessions to delete.
+            user_id (Optional[str]): User ID to filter by. Defaults to None.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+            deleted_ids = {
+                s.get("session_id")
+                for s in sessions
+                if s.get("session_id") in session_ids and (user_id is None or s.get("user_id") == user_id)
+            }
+            sessions = [
+                s
+                for s in sessions
+                if not (s.get("session_id") in session_ids and (user_id is None or s.get("user_id") == user_id))
+            ]
+            self._write_json_file(self.session_table_name, sessions)
+            if deleted_ids:
+                all_runs = self._read_runs_file(create_table_if_not_found=False)
+                kept_runs = [r for r in all_runs if r.get("session_id") not in deleted_ids]
+                if len(kept_runs) != len(all_runs):
+                    self._write_runs_file(kept_runs)
+            log_debug(f"Successfully deleted sessions with ids: {session_ids}")
+
+        except Exception as e:
+            log_warning(f"Error deleting sessions: {str(e)}")
+            raise e
+
+    def get_session(
+        self,
+        session_id: str,
+        session_type: Optional[SessionType] = None,
+        user_id: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+        runs_limit: Optional[int] = None,
+    ) -> Optional[Union[AgentSession, TeamSession, WorkflowSession, Dict[str, Any]]]:
+        """Read a session from the GCS JSON file.
+
+        Args:
+            session_id (str): The ID of the session to read.
+            session_type (Optional[SessionType]): The type of the session to read.
+            user_id (Optional[str]): The ID of the user to read the session for.
+            deserialize (Optional[bool]): Whether to deserialize the session.
+
+        Returns:
+            Union[Session, Dict[str, Any], None]:
+                - When deserialize=True: Session object
+                - When deserialize=False: Session dictionary
+
+        Raises:
+            Exception: If an error occurs while reading the session.
+        """
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+
+            for session_data in sessions:
+                if session_data.get("session_id") == session_id:
+                    if user_id is not None and session_data.get("user_id") != user_id:
+                        continue
+
+                    # Attach runs from the runs file, merged with any legacy `runs` field
+                    runs_data = self._get_session_runs_data(session_id)
+                    session_data["runs"] = merge_runs_table_with_legacy_blob(runs_data, session_data.get("runs"))
+                    if runs_limit is not None:
+                        # No query engine to push "last N" down: filter+slice in memory to
+                        # match the SQL fast path (drop member/skip-status runs, then last N).
+                        session_data["runs"] = filter_context_runs(session_data["runs"] or [])[-runs_limit:]
+
+                    if not deserialize:
+                        return session_data
+
+                    return deserialize_session(session_type, session_data)
+
+            return None
+
+        except Exception as e:
+            log_warning(f"Exception reading from session file: {str(e)}")
+            raise e
+
+    def get_sessions(
+        self,
+        session_type: Optional[SessionType] = None,
+        user_id: Optional[str] = None,
+        component_id: Optional[str] = None,
+        session_name: Optional[str] = None,
+        start_timestamp: Optional[int] = None,
+        end_timestamp: Optional[int] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+        include_runs: bool = True,
+    ) -> Union[List[Session], Tuple[List[Dict[str, Any]], int]]:
+        """Get all sessions from the GCS JSON file with filtering and pagination.
+
+        Args:
+            session_type (Optional[SessionType]): The type of the sessions to read.
+            user_id (Optional[str]): The ID of the user to read the sessions for.
+            component_id (Optional[str]): The ID of the component to read the sessions for.
+            session_name (Optional[str]): The name of the session to read.
+            start_timestamp (Optional[int]): The start timestamp of the sessions to read.
+            end_timestamp (Optional[int]): The end timestamp of the sessions to read.
+            limit (Optional[int]): The limit of the sessions to read.
+            page (Optional[int]): The page of the sessions to read.
+            sort_by (Optional[str]): The field to sort the sessions by.
+            sort_order (Optional[str]): The order to sort the sessions by.
+            deserialize (Optional[bool]): Whether to deserialize the sessions.
+
+        Returns:
+            Union[List[AgentSession], List[TeamSession], List[WorkflowSession], Tuple[List[Dict[str, Any]], int]]:
+                - When deserialize=True: List of sessions
+                - When deserialize=False: Tuple with list of sessions and total count
+
+        Raises:
+            Exception: If an error occurs while reading the sessions.
+        """
+        try:
+            sessions_raw = self._read_json_file(self.session_table_name)
+
+            # Apply filters
+            filtered_sessions = []
+            for session_data in sessions_raw:
+                if user_id is not None and session_data.get("user_id") != user_id:
+                    continue
+                if component_id is not None:
+                    if session_type == SessionType.AGENT and session_data.get("agent_id") != component_id:
+                        continue
+                    elif session_type == SessionType.TEAM and session_data.get("team_id") != component_id:
+                        continue
+                    elif session_type == SessionType.WORKFLOW and session_data.get("workflow_id") != component_id:
+                        continue
+                    elif session_type is None:
+                        if (
+                            session_data.get("agent_id") != component_id
+                            and session_data.get("team_id") != component_id
+                            and session_data.get("workflow_id") != component_id
+                        ):
+                            continue
+                if start_timestamp is not None and (session_data.get("created_at") or 0) < start_timestamp:
+                    continue
+                if end_timestamp is not None and (session_data.get("created_at") or 0) > end_timestamp:
+                    continue
+                if session_name is not None:
+                    stored_name = (session_data.get("session_data") or {}).get("session_name", "")
+                    if session_name.lower() not in stored_name.lower():
+                        continue
+                if session_type is not None:
+                    session_type_value = session_type.value if isinstance(session_type, SessionType) else session_type
+                    if session_data.get("session_type") != session_type_value:
+                        continue
+
+                filtered_sessions.append(session_data)
+
+            total_count = len(filtered_sessions)
+
+            # Apply sorting
+            filtered_sessions = apply_sorting(filtered_sessions, sort_by, sort_order)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                filtered_sessions = filtered_sessions[start_idx : start_idx + limit]
+
+            # Attach runs from the runs file, merged with any legacy `runs` field
+            # Search scans skip the runs table; the record's legacy runs field is kept for merging later.
+            if include_runs and filtered_sessions:
+                runs_by_session = self._get_sessions_runs_data([s["session_id"] for s in filtered_sessions])
+                for s in filtered_sessions:
+                    runs_data = runs_by_session.get(s["session_id"], [])
+                    s["runs"] = merge_runs_table_with_legacy_blob(runs_data, s.get("runs"))
+
+            if not deserialize:
+                return filtered_sessions, total_count
+
+            return deserialize_sessions(session_type, filtered_sessions)
+
+        except Exception as e:
+            log_warning(f"Exception reading from session file: {str(e)}")
+            raise e
+
+    def rename_session(
+        self,
+        session_id: str,
+        session_type: Optional[SessionType],
+        session_name: str,
+        user_id: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Optional[Union[Session, Dict[str, Any]]]:
+        """Rename a session in the GCS JSON file."""
+        try:
+            sessions = self._read_json_file(self.session_table_name)
+
+            for i, session_data in enumerate(sessions):
+                if session_data.get("session_id") != session_id:
+                    continue
+                if session_type is not None and session_data.get("session_type") != session_type.value:
+                    continue
+                if user_id is not None and session_data.get("user_id") != user_id:
+                    continue
+                # Update session name in session_data
+                if "session_data" not in session_data or session_data["session_data"] is None:
+                    session_data["session_data"] = {}
+                session_data["session_data"]["session_name"] = session_name
+
+                sessions[i] = session_data
+                self._write_json_file(self.session_table_name, sessions)
+
+                # Attach runs from the runs file, merged with any legacy `runs` field
+                runs_data = self._get_session_runs_data(session_id)
+                session_data["runs"] = merge_runs_table_with_legacy_blob(runs_data, session_data.get("runs"))
+
+                if not deserialize:
+                    return session_data
+
+                return deserialize_session(session_type, session_data)
+
+            return None
+        except Exception as e:
+            log_warning(f"Exception renaming session: {str(e)}")
+            raise e
+
+    def upsert_session(
+        self, session: Session, deserialize: Optional[bool] = True
+    ) -> Optional[Union[Session, Dict[str, Any]]]:
+        """Insert or update a session in the GCS JSON file."""
+        try:
+            sessions = self._read_json_file(self.session_table_name, create_table_if_not_found=True)
+            session_dict = session.to_dict(include_runs=False)
+
+            # Add session_type based on session instance type
+            if isinstance(session, AgentSession):
+                session_dict["session_type"] = SessionType.AGENT.value
+            elif isinstance(session, TeamSession):
+                session_dict["session_type"] = SessionType.TEAM.value
+            elif isinstance(session, WorkflowSession):
+                session_dict["session_type"] = SessionType.WORKFLOW.value
+
+            reopen_session_ids = get_metrics_reopen_session_ids(sessions, [session_dict])
+
+            # Find existing session to update
+            session_updated = False
+            for i, existing_session in enumerate(sessions):
+                if existing_session.get("session_id") == session_dict.get("session_id") and self._matches_session_key(
+                    existing_session, session
+                ):
+                    existing_uid = existing_session.get("user_id")
+                    if existing_uid is not None and existing_uid != session_dict.get("user_id"):
+                        return None
+                    # Carry the legacy `runs` blob forward. session.to_dict(include_runs=False)
+                    # omits `runs`, so a bare replace here would silently erase any pre-v3
+                    # history that lives only in the legacy blob (upgrade-without-migration
+                    # data loss). Only cleanup_legacy_runs_field() should drop it, explicitly.
+                    legacy_runs = existing_session.get("runs")
+                    session_dict["updated_at"] = int(time.time())
+                    if legacy_runs is not None:
+                        session_dict["runs"] = legacy_runs
+                    # The stored created_at, which a session keeps
+                    if existing_session.get("created_at") is not None:
+                        session_dict["created_at"] = existing_session["created_at"]
+                    sessions[i] = session_dict
+                    session_updated = True
+                    break
+
+            if not session_updated:
+                session_dict["created_at"] = session_dict.get("created_at", int(time.time()))
+                session_dict["updated_at"] = session_dict.get("created_at")
+                sessions.append(session_dict)
+
+            self._write_json_file(self.session_table_name, sessions)
+            if session_dict["session_id"] in reopen_session_ids:
+                self._reopen_metrics_days([session_dict.get("created_at")])
+
+            # Runs are persisted separately via upsert_run by the caller (agent loop).
+            # Attach the in-memory runs to the returned dict so callers see the full picture.
+            session_dict["runs"] = [run if isinstance(run, dict) else run.to_dict() for run in session.runs or []]
+
+            if not deserialize:
+                return session_dict
+
+            return session
+
+        except Exception as e:
+            log_warning(f"Exception upserting session: {str(e)}")
+            raise e
+
+    def upsert_sessions(
+        self, sessions: List[Session], deserialize: Optional[bool] = True, preserve_updated_at: bool = False
+    ) -> List[Union[Session, Dict[str, Any]]]:
+        """
+        Bulk upsert multiple sessions for improved performance on large datasets.
+
+        Args:
+            sessions (List[Session]): List of sessions to upsert.
+            deserialize (Optional[bool]): Whether to deserialize the sessions. Defaults to True.
+
+        Returns:
+            List[Union[Session, Dict[str, Any]]]: List of upserted sessions.
+
+        Raises:
+            Exception: If an error occurs during bulk upsert.
+        """
+        if not sessions:
+            return []
+
+        try:
+            log_info(
+                f"GcsJsonDb doesn't support efficient bulk operations, falling back to individual upserts for {len(sessions)} sessions"
+            )
+
+            # Fall back to individual upserts
+            results = []
+            for session in sessions:
+                if session is not None:
+                    result = self.upsert_session(session, deserialize=deserialize)
+                    if result is not None:
+                        results.append(result)
+            return results
+
+        except Exception as e:
+            log_error(f"Exception during bulk session upsert: {str(e)}")
+            return []
+
+    def _matches_session_key(self, existing_session: Dict[str, Any], session: Session) -> bool:
+        """Check if existing session matches the key for the session type."""
+        if isinstance(session, AgentSession):
+            return existing_session.get("agent_id") == session.agent_id
+        elif isinstance(session, TeamSession):
+            return existing_session.get("team_id") == session.team_id
+        elif isinstance(session, WorkflowSession):
+            return existing_session.get("workflow_id") == session.workflow_id
+        return False
+
+    # -- Memory methods --
+    def delete_user_memory(self, memory_id: str, user_id: Optional[str] = None) -> None:
+        """Delete a user memory from the GCS JSON file.
+
+        Args:
+            memory_id (str): The ID of the memory to delete.
+            user_id (Optional[str]): The ID of the user. If provided, verifies ownership before deletion.
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+            original_count = len(memories)
+
+            # Filter out the memory, with optional user_id verification
+            memories = [
+                m
+                for m in memories
+                if not (m.get("memory_id") == memory_id and (user_id is None or m.get("user_id") == user_id))
+            ]
+
+            if len(memories) < original_count:
+                self._write_json_file(self.memory_table_name, memories)
+                log_debug(f"Successfully deleted user memory id: {memory_id}")
+
+            else:
+                log_debug(f"No user memory found with id: {memory_id}")
+
+        except Exception as e:
+            log_warning(f"Error deleting user memory: {str(e)}")
+            raise e
+
+    def delete_user_memories(self, memory_ids: List[str], user_id: Optional[str] = None) -> None:
+        """Delete multiple user memories from the GCS JSON file.
+
+        Args:
+            memory_ids (List[str]): The IDs of the memories to delete.
+            user_id (Optional[str]): The ID of the user. If provided, verifies ownership before deletion.
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+
+            # Filter out memories, with optional user_id verification
+            memories = [
+                m
+                for m in memories
+                if not (m.get("memory_id") in memory_ids and (user_id is None or m.get("user_id") == user_id))
+            ]
+
+            self._write_json_file(self.memory_table_name, memories)
+            log_debug(f"Successfully deleted user memories with ids: {memory_ids}")
+        except Exception as e:
+            log_warning(f"Error deleting user memories: {str(e)}")
+            raise e
+
+    def get_all_memory_topics(self, user_id: Optional[str] = None) -> List[str]:
+        """Get all memory topics from the GCS JSON file.
+
+        Args:
+            user_id (Optional[str]): The ID of the user to filter by.
+
+        Returns:
+            List[str]: List of unique memory topics.
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+            topics = set()
+            for memory in memories:
+                if user_id is not None and memory.get("user_id") != user_id:
+                    continue
+                memory_topics = memory.get("topics", [])
+                if isinstance(memory_topics, list):
+                    topics.update(memory_topics)
+            return list(topics)
+
+        except Exception as e:
+            log_warning(f"Exception reading from memory file: {str(e)}")
+            raise e
+
+    def get_user_memory(
+        self, memory_id: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
+    ) -> Optional[Union[UserMemory, Dict[str, Any]]]:
+        """Get a memory from the GCS JSON file.
+
+        Args:
+            memory_id (str): The ID of the memory to retrieve.
+            deserialize (Optional[bool]): Whether to deserialize to UserMemory object. Defaults to True.
+            user_id (Optional[str]): The ID of the user. If provided, verifies ownership before returning.
+
+        Returns:
+            Optional[Union[UserMemory, Dict[str, Any]]]: The memory if found and ownership matches, None otherwise.
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+
+            for memory_data in memories:
+                if memory_data.get("memory_id") == memory_id:
+                    # Verify user ownership if user_id is provided
+                    if user_id is not None and memory_data.get("user_id") != user_id:
+                        continue
+
+                    if not deserialize:
+                        return memory_data
+
+                    return UserMemory.from_dict(memory_data)
+
+            return None
+        except Exception as e:
+            log_warning(f"Exception reading from memory file: {str(e)}")
+            raise e
+
+    def get_user_memories(
+        self,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        topics: Optional[List[str]] = None,
+        search_content: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Union[List[UserMemory], Tuple[List[Dict[str, Any]], int]]:
+        """Get all memories from the GCS JSON file with filtering and pagination."""
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+
+            # Apply filters
+            filtered_memories = []
+            for memory_data in memories:
+                if user_id is not None and memory_data.get("user_id") != user_id:
+                    continue
+                if agent_id is not None and memory_data.get("agent_id") != agent_id:
+                    continue
+                if team_id is not None and memory_data.get("team_id") != team_id:
+                    continue
+                if topics is not None:
+                    memory_topics = memory_data.get("topics", [])
+                    if not any(topic in memory_topics for topic in topics):
+                        continue
+                if search_content is not None:
+                    memory_content = str(memory_data.get("memory", ""))
+                    if search_content.lower() not in memory_content.lower():
+                        continue
+
+                filtered_memories.append(memory_data)
+
+            total_count = len(filtered_memories)
+
+            # Apply sorting
+            filtered_memories = apply_sorting(filtered_memories, sort_by, sort_order)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                filtered_memories = filtered_memories[start_idx : start_idx + limit]
+
+            if not deserialize:
+                return filtered_memories, total_count
+
+            return [UserMemory.from_dict(memory) for memory in filtered_memories]
+
+        except Exception as e:
+            log_warning(f"Exception reading from memory file: {str(e)}")
+            raise e
+
+    def get_user_memory_stats(
+        self, limit: Optional[int] = None, page: Optional[int] = None, user_id: Optional[str] = None
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Get user memory statistics.
+
+        Args:
+            limit (Optional[int]): Maximum number of results to return.
+            page (Optional[int]): Page number for pagination.
+            user_id (Optional[str]): User ID for filtering.
+
+        Returns:
+            Tuple[List[Dict[str, Any]], int]: List of user memory statistics and total count.
+        """
+        try:
+            memories = self._read_json_file(self.memory_table_name)
+            user_stats = {}
+
+            for memory in memories:
+                memory_user_id = memory.get("user_id")
+                # filter by user_id if provided
+                if user_id is not None and memory_user_id != user_id:
+                    continue
+                if memory_user_id:
+                    if memory_user_id not in user_stats:
+                        user_stats[memory_user_id] = {
+                            "user_id": memory_user_id,
+                            "total_memories": 0,
+                            "last_memory_updated_at": 0,
+                        }
+                    user_stats[memory_user_id]["total_memories"] += 1
+                    updated_at = memory.get("updated_at", 0)
+                    if updated_at > user_stats[memory_user_id]["last_memory_updated_at"]:
+                        user_stats[memory_user_id]["last_memory_updated_at"] = updated_at
+
+            stats_list = list(user_stats.values())
+            stats_list.sort(key=lambda x: x["last_memory_updated_at"], reverse=True)
+
+            total_count = len(stats_list)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                stats_list = stats_list[start_idx : start_idx + limit]
+
+            return stats_list, total_count
+
+        except Exception as e:
+            log_warning(f"Exception getting user memory stats: {str(e)}")
+            raise e
+
+    def upsert_user_memory(
+        self, memory: UserMemory, deserialize: Optional[bool] = True
+    ) -> Optional[Union[UserMemory, Dict[str, Any]]]:
+        """Upsert a user memory in the GCS JSON file."""
+        try:
+            memories = self._read_json_file(self.memory_table_name, create_table_if_not_found=True)
+
+            if memory.memory_id is None:
+                memory.memory_id = str(uuid4())
+
+            memory_dict = memory.to_dict() if hasattr(memory, "to_dict") else memory.__dict__
+            memory_dict["updated_at"] = int(time.time())
+
+            # Find existing memory to update
+            memory_updated = False
+            for i, existing_memory in enumerate(memories):
+                if existing_memory.get("memory_id") == memory.memory_id:
+                    memories[i] = memory_dict
+                    memory_updated = True
+                    break
+
+            if not memory_updated:
+                memories.append(memory_dict)
+
+            self._write_json_file(self.memory_table_name, memories)
+
+            if not deserialize:
+                return memory_dict
+            return UserMemory.from_dict(memory_dict)
+
+        except Exception as e:
+            log_error(f"Exception upserting user memory: {str(e)}")
+            raise e
+
+    def upsert_memories(
+        self, memories: List[UserMemory], deserialize: Optional[bool] = True, preserve_updated_at: bool = False
+    ) -> List[Union[UserMemory, Dict[str, Any]]]:
+        """
+        Bulk upsert multiple user memories for improved performance on large datasets.
+
+        Args:
+            memories (List[UserMemory]): List of memories to upsert.
+            deserialize (Optional[bool]): Whether to deserialize the memories. Defaults to True.
+
+        Returns:
+            List[Union[UserMemory, Dict[str, Any]]]: List of upserted memories.
+
+        Raises:
+            Exception: If an error occurs during bulk upsert.
+        """
+        if not memories:
+            return []
+
+        try:
+            log_info(
+                f"GcsJsonDb doesn't support efficient bulk operations, falling back to individual upserts for {len(memories)} memories"
+            )
+            # Fall back to individual upserts
+            results = []
+            for memory in memories:
+                if memory is not None:
+                    result = self.upsert_user_memory(memory, deserialize=deserialize)
+                    if result is not None:
+                        results.append(result)
+            return results
+
+        except Exception as e:
+            log_error(f"Exception during bulk memory upsert: {str(e)}")
+            return []
+
+    def clear_memories(self) -> None:
+        """Delete all memories from the database.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            # Simply write an empty list to the memory JSON file
+            self._write_json_file(self.memory_table_name, [])
+
+        except Exception as e:
+            log_warning(f"Exception deleting all memories: {str(e)}")
+            raise e
+
+    # -- Metrics methods --
+    def _read_metrics_file(self, filename: str) -> List[Dict[str, Any]]:
+        """Read the rows of a metrics file, their date a date. Empty while the file does not exist."""
+        return deserialize_metrics_rows(self._read_json_file(filename, create_table_if_not_found=False))
+
+    def _reopen_metrics_days(self, created_ats: Sequence[Optional[int]]) -> None:
+        """Reopen the metrics of each day a write changed, after the write, so the next calculation rebuilds it.
+
+        A failed reopen never fails the write itself, and the days it could not reopen are retried by the next write.
+
+        Args:
+            created_ats (Sequence[Optional[int]]): The stored created_at of each run or session the write changed.
+        """
+        from google.cloud.exceptions import PreconditionFailed  # type: ignore[import-untyped]
+
+        days = sorted(
+            {day for created_at in created_ats if (day := metrics_day_to_reopen(created_at)) is not None}
+            | self._metrics_days_not_reopened
+        )
+        if not days:
+            return
+        try:
+            for attempt in range(METRICS_WRITE_RETRIES + 1):
+                aggregate_metrics_rows, generation = self._read_json_file_with_generation(
+                    self.aggregate_metrics_table_name
+                )
+                # No aggregate metrics file until a calculation started: the first one builds every day
+                if generation == 0:
+                    self._metrics_days_not_reopened.clear()
+                    return
+                aggregate_metrics_by_key = get_metrics_rows_by_key(
+                    deserialize_metrics_rows(aggregate_metrics_rows), AGGREGATE_METRICS_KEY_COLUMNS
+                )
+                for day in days:
+                    aggregate_metrics_by_key[("daily", day, "")] = reopened_aggregate_metrics_row(
+                        aggregate_metrics_by_key.get(("daily", day, "")), day
+                    )
+                try:
+                    self._write_json_file(
+                        self.aggregate_metrics_table_name,
+                        list(aggregate_metrics_by_key.values()),
+                        if_generation_match=generation,
+                        indent=None,
+                    )
+                    break
+                except PreconditionFailed:
+                    if attempt == METRICS_WRITE_RETRIES:
+                        raise
+            self._metrics_days_not_reopened.difference_update(days)
+        except Exception as e:
+            self._metrics_days_not_reopened.update(days)
+            log_warning(
+                f"Could not reopen the metrics of {', '.join(str(day) for day in days)}: {database_error_message(e)}"
+            )
+
+    def _get_metrics_refresh_row(self) -> Tuple[Optional[Dict[str, Any]], int]:
+        """Get the row of the metrics refreshes file, and the locked_at at or before which its lock is stale, by the
+        process's clock."""
+        refresh_rows = self._read_json_file(self.metrics_refreshes_table_name, create_table_if_not_found=False)
+        if not refresh_rows:
+            # Before the first refresh there is no lock to judge stale
+            return None, 0
+        return refresh_rows[0], int(time.time()) - METRICS_LOCK_SECONDS
+
+    def _claim_metrics_refresh(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        """Claim the row of the metrics refreshes file, so one process calculates metrics at a time.
+
+        Written only while the file is still at the generation read, so two processes never both find the row free.
+
+        Args:
+            worker_id (str): The id of this calculation, which heartbeats and releases the claim.
+
+        Returns:
+            Optional[Dict[str, Any]]: The claimed row, with when the last calculation finished and its fingerprint.
+                None when another process holds it.
+        """
+        from google.cloud.exceptions import PreconditionFailed  # type: ignore[import-untyped]
+
+        for _ in range(METRICS_WRITE_RETRIES + 1):
+            refresh_rows, generation = self._read_json_file_with_generation(self.metrics_refreshes_table_name)
+            refresh_row = refresh_rows[0] if refresh_rows else None
+            now = int(time.time())
+            # A stale lock is taken over: the process that held it stopped
+            if (
+                refresh_row is not None
+                and refresh_row["locked_by"] is not None
+                and refresh_row["locked_at"] > now - METRICS_LOCK_SECONDS
+            ):
+                return None
+            refresh_row = {
+                "id": METRICS_REFRESH_ID,
+                "finished_at": None,
+                "fingerprint": None,
+                **(refresh_row or {}),
+                "locked_by": worker_id,
+                "locked_at": now,
+                "started_at": now,
+                "status": "running",
+                "error": None,
+            }
+            try:
+                self._write_json_file(
+                    self.metrics_refreshes_table_name, [refresh_row], if_generation_match=generation, indent=None
+                )
+                break
+            except PreconditionFailed:
+                pass
+        else:
+            return None
+        return refresh_row
+
+    def _mark_metrics_refresh_rebuild(self) -> bool:
+        """Write a mark no fingerprint equals on the row of the metrics refreshes file, so the next calculation
+        rebuilds yesterday and today. False when another process wrote the file on every try."""
+        from google.cloud.exceptions import PreconditionFailed  # type: ignore[import-untyped]
+
+        for _ in range(METRICS_WRITE_RETRIES + 1):
+            refresh_rows, generation = self._read_json_file_with_generation(self.metrics_refreshes_table_name)
+            if not refresh_rows:
+                return True
+            try:
+                self._write_json_file(
+                    self.metrics_refreshes_table_name,
+                    [{**refresh_rows[0], "fingerprint": ["rebuild", uuid4().hex]}],
+                    if_generation_match=generation,
+                    indent=None,
+                )
+                return True
+            except PreconditionFailed:
+                pass
+        return False
+
+    def _heartbeat_metrics_refresh(self, worker_id: str) -> bool:
+        """Refresh locked_at for this worker's metrics refresh. False when another process took it over."""
+        from google.cloud.exceptions import PreconditionFailed  # type: ignore[import-untyped]
+
+        for attempt in range(METRICS_WRITE_RETRIES + 1):
+            refresh_rows, generation = self._read_json_file_with_generation(self.metrics_refreshes_table_name)
+            if not refresh_rows or refresh_rows[0]["locked_by"] != worker_id:
+                return False
+            try:
+                self._write_json_file(
+                    self.metrics_refreshes_table_name,
+                    [{**refresh_rows[0], "locked_at": int(time.time())}],
+                    if_generation_match=generation,
+                    indent=None,
+                )
+                break
+            except PreconditionFailed:
+                if attempt == METRICS_WRITE_RETRIES:
+                    raise
+        return True
+
+    def _release_metrics_refresh(
+        self,
+        worker_id: Optional[str],
+        error: Optional[str] = None,
+        fingerprint: Optional[List[Any]] = None,
+        stopped: bool = False,
+        claimed_fingerprint: Optional[List[Any]] = None,
+    ) -> None:
+        """Release the row of the metrics refreshes file: completed, with the fingerprint, without an error, failed
+        with one, and as the last completed refresh left it when the calculation stopped.
+
+        Args:
+            worker_id (Optional[str]): The id of the calculation that claimed the row. None writes the row only while
+                no process holds it, and creates it before any refresh.
+            error (Optional[str]): The error the calculation failed with. None when it completed.
+            fingerprint (Optional[List[Any]]): The fingerprint of yesterday and today, stored once it completed.
+            stopped (bool): Whether the calculation stopped before it finished.
+            claimed_fingerprint (Optional[List[Any]]): The fingerprint of the claimed row. A rebuild that marked
+                another one since keeps its mark.
+        """
+        from google.cloud.exceptions import PreconditionFailed  # type: ignore[import-untyped]
+
+        try:
+            for attempt in range(METRICS_WRITE_RETRIES + 1):
+                refresh_rows, generation = self._read_json_file_with_generation(self.metrics_refreshes_table_name)
+                if worker_id is None and not refresh_rows:
+                    # Before any refresh there is no row to update
+                    refresh_row: Dict[str, Any] = {
+                        "id": METRICS_REFRESH_ID,
+                        "started_at": int(time.time()),
+                        "finished_at": None,
+                        "fingerprint": None,
+                    }
+                elif not refresh_rows or refresh_rows[0]["locked_by"] != worker_id:
+                    return
+                else:
+                    refresh_row = refresh_rows[0]
+                values: Dict[str, Any] = {"locked_by": None, "locked_at": None}
+                if stopped:
+                    # The days it did not reach stay open for the next calculation; a first one that stopped has none
+                    # to show
+                    finished = refresh_row["finished_at"] is not None
+                    values.update(
+                        status="completed" if finished else "failed", error=None if finished else METRICS_STOPPED_ERROR
+                    )
+                elif error is None:
+                    values.update(status="completed", error=None, finished_at=int(time.time()), fingerprint=fingerprint)
+                    if refresh_row["fingerprint"] != claimed_fingerprint:
+                        # A rebuild that marked the fingerprint after the claim keeps its mark, so the next
+                        # calculation rebuilds yesterday and today
+                        values["fingerprint"] = refresh_row["fingerprint"]
+                else:
+                    values.update(status="failed", error=error)
+                try:
+                    self._write_json_file(
+                        self.metrics_refreshes_table_name,
+                        [{**refresh_row, **values}],
+                        if_generation_match=generation,
+                        indent=None,
+                    )
+                    break
+                except PreconditionFailed:
+                    if attempt == METRICS_WRITE_RETRIES:
+                        raise
+        except Exception as e:
+            log_debug(f"Error releasing metrics refresh: {e}")
+
+    def _write_metrics_rows(
+        self,
+        rows_by_key: Optional[Dict[Tuple[Any, ...], Dict[str, Any]]],
+        rows_generation: int,
+        periods: List[Tuple[List[Dict[str, Any]], bool, Optional[int]]],
+        worker_id: str,
+    ) -> bool:
+        """Write the component metrics rows of the calculated days, then the aggregate metrics rows of each calculated
+        day and month. False when another process took the refresh over, and nothing more was written.
+
+        Args:
+            rows_by_key (Optional[Dict[Tuple[Any, ...], Dict[str, Any]]]): Every component metrics row, by key. None
+                when no row changed.
+            rows_generation (int): The generation of the component metrics file when its rows were read.
+            periods (List[Tuple[List[Dict[str, Any]], bool, Optional[int]]]): The aggregate metrics rows of each day and
+                month, from build_aggregate_metrics_rows, whether its component rows changed, and the version of its
+                everyone row read before its runs.
+            worker_id (str): The id of this calculation.
+        """
+        from google.cloud.exceptions import PreconditionFailed  # type: ignore[import-untyped]
+
+        # The months this write rebuilds, which a rebuilt day of theirs leaves to be rebuilt here
+        month_starts = {
+            period_rows[0]["date"] for period_rows, _, _ in periods if period_rows[0]["aggregation_period"] == "monthly"
+        }
+        if rows_by_key is None and not periods:
+            return True
+        # Checked before the rows are written, so a process whose lock went stale never overwrites the rows of the
+        # process that took the refresh over
+        if not self._heartbeat_metrics_refresh(worker_id):
+            return False
+        if rows_by_key is not None:
+            try:
+                self._write_json_file(
+                    self.component_metrics_table_name,
+                    list(rows_by_key.values()),
+                    if_generation_match=rows_generation,
+                    indent=None,
+                )
+            except PreconditionFailed:
+                # Written since it was read, by a process that took the refresh over
+                return False
+            if not self._heartbeat_metrics_refresh(worker_id):
+                return False
+
+        # Written last, so a version never moves without the rows it tells of, and read again when another process
+        # wrote since, so a reopen written then is kept
+        for attempt in range(METRICS_WRITE_RETRIES + 1):
+            aggregate_metrics_rows, generation = self._read_json_file_with_generation(self.aggregate_metrics_table_name)
+            aggregate_metrics_by_key = get_metrics_rows_by_key(
+                deserialize_metrics_rows(aggregate_metrics_rows), AGGREGATE_METRICS_KEY_COLUMNS
+            )
+            for period_rows, rows_changed, read_version in periods:
+                write_aggregate_metrics_rows(aggregate_metrics_by_key, period_rows, rows_changed, read_version)
+                month_start = period_rows[0]["date"].replace(day=1)
+                if rows_changed and month_start not in month_starts:
+                    # Reopened with the day, so a calculation that stops before its months leaves the month for
+                    # the next
+                    reopen_metrics_month(aggregate_metrics_by_key, month_start)
+            try:
+                self._write_json_file(
+                    self.aggregate_metrics_table_name,
+                    list(aggregate_metrics_by_key.values()),
+                    if_generation_match=generation,
+                    indent=None,
+                )
+                break
+            except PreconditionFailed:
+                if attempt == METRICS_WRITE_RETRIES:
+                    raise
+        return True
+
+    def calculate_metrics(self, rebuild_from: Optional[date] = None) -> Optional[list[dict]]:
+        """Calculate metrics for every day that changed since the last calculation.
+
+        One process calculates at a time: the others return at once, having read nothing.
+
+        Args:
+            rebuild_from (Optional[date]): Also rebuild every day from this date to today, as after a release that
+                changed how metrics are counted.
+
+        Returns:
+            Optional[list[dict]]: The metrics of the days calculated, or of today when nothing changed, as get_metrics
+                returns them. None when another process is calculating them.
+
+        Raises:
+            Exception: If an error occurs during metrics calculation.
+        """
+        try:
+            calculated_dates = self.calculate_metrics_dates(rebuild_from=rebuild_from)
+            if calculated_dates is None:
+                return None
+            if not calculated_dates:
+                # A refresh that changed no day answers with today's metrics
+                calculated_dates = [datetime.now(timezone.utc).date()]
+            metrics, _ = self._get_metrics_rows(calculated_dates[0], calculated_dates[-1], None)
+            return [metric for metric in metrics if metric["date"] in calculated_dates]
+
+        except Exception as e:
+            log_error(f"Exception refreshing metrics: {str(e)}")
+            raise e
+
+    def calculate_metrics_dates(
+        self, should_stop: Optional[Callable[[], bool]] = None, rebuild_from: Optional[date] = None
+    ) -> Optional[List[date]]:
+        """Calculate metrics for every day that changed since the last calculation, as calculate_metrics does,
+        without reading back the metrics of those days.
+
+        The sessions and runs files are read once for every day, and the days are written together.
+
+        Args:
+            should_stop (Optional[Callable[[], bool]]): Checked before each day and month. Once it returns True, the
+                calculation writes the days it calculated, releases the refresh and stops; the next one continues from
+                the first day still open.
+            rebuild_from (Optional[date]): Also rebuild every day from this date to today.
+
+        Returns:
+            Optional[List[date]]: The days calculated, oldest first. None when another process is calculating them.
+
+        Raises:
+            Exception: If an error occurs during metrics calculation.
+        """
+        from google.cloud.exceptions import PreconditionFailed  # type: ignore[import-untyped]
+
+        # Created before the claim, so a write during the first calculation reopens its day. Only while it does
+        # not exist, so a file another process wrote is never written over
+        try:
+            self._write_json_file(self.aggregate_metrics_table_name, [], if_generation_match=0, indent=None)
+        except PreconditionFailed:
+            pass
+
+        if rebuild_from is not None:
+            # Reopened as a write reopens a day, before the claim, so a calculation another process is running
+            # leaves them to the next one
+            try:
+                for attempt in range(METRICS_WRITE_RETRIES + 1):
+                    aggregate_metrics_rows, generation = self._read_json_file_with_generation(
+                        self.aggregate_metrics_table_name
+                    )
+                    aggregate_metrics_by_key = get_metrics_rows_by_key(
+                        deserialize_metrics_rows(aggregate_metrics_rows), AGGREGATE_METRICS_KEY_COLUMNS
+                    )
+                    reopen_metrics_days_from(aggregate_metrics_by_key, rebuild_from)
+                    try:
+                        self._write_json_file(
+                            self.aggregate_metrics_table_name,
+                            list(aggregate_metrics_by_key.values()),
+                            if_generation_match=generation,
+                            indent=None,
+                        )
+                        break
+                    except PreconditionFailed:
+                        if attempt == METRICS_WRITE_RETRIES:
+                            raise
+                # Yesterday and today are picked by the fingerprint, so it is marked for the next one too
+                if not self._mark_metrics_refresh_rebuild():
+                    return None
+            except Exception as e:
+                # Failed before the claim, so the refresh status shows it
+                self._release_metrics_refresh(None, error=database_error_message(e))
+                raise
+
+        worker_id = str(uuid4())
+        # Claimed before anything is read, so a process that finds another calculating reads nothing
+        refresh_row = self._claim_metrics_refresh(worker_id)
+        if refresh_row is None:
+            return None
+
+        try:
+            aggregate_metrics_by_key = get_metrics_rows_by_key(
+                self._read_metrics_file(self.aggregate_metrics_table_name), AGGREGATE_METRICS_KEY_COLUMNS
+            )
+
+            # Read after the versions of the days, so a run written while they are calculated moves its day. A
+            # manual compaction's usage, which no run carries, is read from the session's data
+            sessions = [
+                {**session, "compaction_metrics": (session.get("session_data") or {}).get("compaction_metrics")}
+                for session in self._read_json_file(self.session_table_name, create_table_if_not_found=False)
+            ]
+            runs = self._read_runs_file(create_table_if_not_found=False)
+            dates_to_process, fingerprint = get_metrics_dates_to_calculate(
+                aggregate_metrics_by_key, sessions, runs, refresh_row, rebuild_from
+            )
+
+            calculated_dates: List[date] = []
+            periods: List[Tuple[List[Dict[str, Any]], bool, Optional[int]]] = []
+            rows_changed = False
+            component_rows, rows_generation = self._read_json_file_with_generation(self.component_metrics_table_name)
+            rows_by_key = get_metrics_rows_by_key(
+                deserialize_metrics_rows(component_rows), COMPONENT_METRICS_KEY_COLUMNS
+            )
+            stopped = False
+            if dates_to_process:
+                run_ids = {run["run_id"] for run in runs if run.get("run_id")}
+                # Legacy runs are counted until the v3.0.0 migration is stamped, unless the runs file holds them too
+                if packaging_version.parse(
+                    self.get_latest_schema_version(self.session_table_name) or "2.0.0"
+                ) < packaging_version.parse("3.0.0"):
+                    legacy_runs = [run for run in get_metrics_legacy_runs(sessions) if run["run_id"] not in run_ids]
+                    runs = runs + legacy_runs
+                    if not self._heartbeat_metrics_refresh(worker_id):
+                        return None
+                    # A legacy run is dated on its own day, which may hold no session or run of the files
+                    today = datetime.now(timezone.utc).date()
+                    dates_to_process = sorted(
+                        set(dates_to_process)
+                        | {
+                            day
+                            for run in legacy_runs
+                            if run.get("created_at") is not None
+                            and (day := datetime.fromtimestamp(run["created_at"], tz=timezone.utc).date()) <= today
+                            and (
+                                refresh_row["finished_at"] is None or (rebuild_from is not None and day >= rebuild_from)
+                            )
+                        }
+                    )
+                start_timestamp = int(
+                    datetime.combine(dates_to_process[0], datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()
+                )
+                end_timestamp = int(
+                    datetime.combine(dates_to_process[-1] + timedelta(days=1), datetime.min.time())
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                )
+                sessions_by_day = get_metrics_records_by_day(sessions, start_timestamp, end_timestamp)
+                runs_by_day = get_metrics_records_by_day(runs, start_timestamp, end_timestamp)
+                runs_by_id = {run["run_id"]: run for run in runs if run.get("run_id")}
+                stored_rows_by_day: Dict[date, List[Dict[str, Any]]] = {}
+                for row in rows_by_key.values():
+                    stored_rows_by_day.setdefault(row["date"], []).append(row)
+
+                for date_to_process in dates_to_process:
+                    if should_stop is not None and should_stop():
+                        stopped = True
+                        break
+                    aggregate_metrics_rows, day_rows_changed = calculate_date_metrics(
+                        rows_by_key,
+                        date_to_process,
+                        sessions_by_day.get(date_to_process, []),
+                        runs_by_day.get(date_to_process, []),
+                        stored_rows_by_day.get(date_to_process, []),
+                        runs_by_id,
+                    )
+                    stored_everyone_row = aggregate_metrics_by_key.get(("daily", date_to_process, ""))
+                    periods.append(
+                        (
+                            aggregate_metrics_rows,
+                            day_rows_changed,
+                            stored_everyone_row["version"] if stored_everyone_row is not None else None,
+                        )
+                    )
+                    rows_changed = rows_changed or day_rows_changed
+                    calculated_dates.append(date_to_process)
+
+            # A month row is read only once completed, so a month is built only once its last day can be completed
+            month_starts = sorted(
+                month_start
+                for month_start in set(get_months_to_calculate_metrics_for(calculated_dates))
+                | set(get_open_metrics_months(aggregate_metrics_by_key))
+                if metrics_day_completed(metrics_month_end(month_start))
+            )
+            for month_start in month_starts:
+                if stopped or (should_stop is not None and should_stop()):
+                    stopped = True
+                    break
+                stored_everyone_row = aggregate_metrics_by_key.get(("monthly", month_start, ""))
+                periods.append(
+                    (
+                        calculate_month_metrics(rows_by_key, month_start),
+                        False,
+                        stored_everyone_row["version"] if stored_everyone_row is not None else None,
+                    )
+                )
+
+            # One write of each file for every day and month, as each write replaces the whole file
+            if not self._write_metrics_rows(rows_by_key if rows_changed else None, rows_generation, periods, worker_id):
+                return None
+            if stopped:
+                self._release_metrics_refresh(worker_id, stopped=True)
+                return None
+
+        except Exception as e:
+            self._release_metrics_refresh(worker_id, error=database_error_message(e))
+            raise
+
+        self._release_metrics_refresh(
+            worker_id, fingerprint=fingerprint, claimed_fingerprint=refresh_row["fingerprint"]
+        )
+
+        if not calculated_dates:
+            log_debug("Metrics already calculated for all relevant dates.", log_level=2)
+            return []
+
+        return calculated_dates
+
+    def _get_metrics_by_owner(
+        self, starting_date: Optional[date], ending_date: Optional[date], user_id: Optional[str]
+    ) -> Tuple[List[dict], Optional[int]]:
+        """Get the metrics of each user and day from the component metrics, in the shape of the metrics table."""
+        rows = self._read_metrics_file(self.component_metrics_table_name)
+        if user_id is not None:
+            rows = [row for row in rows if row["user_id"] == user_id]
+        day_rows = [
+            row
+            for row in rows
+            if row["aggregation_period"] == "daily"
+            and (starting_date is None or row["date"] >= starting_date)
+            and (ending_date is None or row["date"] <= ending_date)
+        ]
+        if not day_rows:
+            return [], None
+
+        # Get the latest updated_at, scoped to the same user filter
+        latest_updated_at = max((row["updated_at"] for row in rows if row.get("updated_at") is not None), default=None)
+        return build_metrics_by_owner_from_rows(day_rows), latest_updated_at
+
+    def _get_aggregate_metrics_rows(
+        self, starting_date: Optional[date], ending_date: Optional[date], user_id: Optional[str]
+    ) -> Tuple[List[dict], Optional[int]]:
+        """Get the day rows of the aggregate metrics file in the shape of the metrics table: the everyone rows for
+        ``""``, one user's rows for a name, and every user's rows for ``None``."""
+        aggregate_metrics_rows = self._read_metrics_file(self.aggregate_metrics_table_name)
+        rows = sorted(
+            (
+                row
+                for row in aggregate_metrics_rows
+                if row["aggregation_period"] == "daily"
+                and (starting_date is None or row["date"] >= starting_date)
+                and (ending_date is None or row["date"] <= ending_date)
+                and (row["user_id"] != "" if user_id is None else row["user_id"] == user_id)
+                # A day without sessions or runs keeps an everyone row of zeros, where agno_metrics kept no row. A
+                # day whose only run is a regenerated one has its tokens but no count
+                and (
+                    any(row[column] for column in AGGREGATE_METRICS_COUNT_COLUMNS if column != "users_count")
+                    or row["total_tokens"] > 0
+                )
+            ),
+            key=lambda row: (row["date"], row["user_id"]),
+        )
+        if not rows:
+            return [], None
+
+        # Get the latest updated_at, scoped to the same user filter
+        latest_updated_at = max(
+            (
+                row["updated_at"]
+                for row in aggregate_metrics_rows
+                if row["aggregation_period"] == "daily"
+                and (row["user_id"] != "" if user_id is None else row["user_id"] == user_id)
+                and row["updated_at"] is not None
+            ),
+            default=None,
+        )
+        return build_metrics_from_aggregate_metrics(rows), latest_updated_at
+
+    def _get_metrics_rows(
+        self, starting_date: Optional[date], ending_date: Optional[date], user_id: Optional[str]
+    ) -> Tuple[List[dict], Optional[int]]:
+        """Get the metrics of each user and day, as get_metrics returns them once the first calculate_metrics has
+        finished: a user's from that user's rows, the runs with no user from their component metrics rows."""
+        if user_id == "":
+            return self._get_metrics_by_owner(starting_date, ending_date, user_id)
+        metrics, latest_updated_at = self._get_aggregate_metrics_rows(starting_date, ending_date, user_id)
+        if user_id is not None:
+            return metrics, latest_updated_at
+
+        unowned_metrics, unowned_updated_at = self._get_metrics_by_owner(starting_date, ending_date, "")
+        latest_updated_at = max(
+            (updated_at for updated_at in [latest_updated_at, unowned_updated_at] if updated_at is not None),
+            default=None,
+        )
+        return sorted(metrics + unowned_metrics, key=lambda x: (x["date"], x["user_id"] or "")), latest_updated_at
+
+    def _metrics_calculated(self) -> bool:
+        """Whether the first calculate_metrics has finished, so reads take the metrics rows over agno_metrics."""
+        refresh_row = self._get_metrics_refresh_row()[0]
+        return refresh_row is not None and refresh_row["finished_at"] is not None
+
+    def get_metrics(
+        self,
+        starting_date: Optional[date] = None,
+        ending_date: Optional[date] = None,
+        user_id: Optional[str] = None,
+    ) -> Tuple[List[dict], Optional[int]]:
+        """Get all metrics matching the given date range.
+
+        Metrics are read from the aggregate metrics and component metrics files once the first calculate_metrics has
+        finished, and from the deprecated metrics file until then. A read never calculates them: checking for new
+        sessions and runs would download the whole runs file. calculate_metrics does.
+
+        Args:
+            starting_date (Optional[date]): The starting date to filter metrics by.
+            ending_date (Optional[date]): The ending date to filter metrics by.
+            user_id (Optional[str]): The ID of the user to filter by. If not provided, all metrics are returned.
+
+        Returns:
+            Tuple[List[dict], Optional[int]]: A tuple containing the metrics and the timestamp of the latest update.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            if self._metrics_calculated():
+                return self._get_metrics_rows(starting_date, ending_date, user_id)
+
+            metrics = self._read_json_file(self.metrics_table_name)
+            # Records written before ownership existed hold a whole day, and only an
+            # unscoped read sees them: an owner filter excludes them already
+            if user_id is None:
+                metrics = drop_legacy_metrics(metrics)
+
+            filtered_metrics = []
+            latest_updated_at = None
+
+            for metric in metrics:
+                metric_date = datetime.strptime(metric.get("date", ""), "%Y-%m-%d").date()
+
+                if starting_date and metric_date < starting_date:
+                    continue
+                if ending_date and metric_date > ending_date:
+                    continue
+                if user_id is not None and metric.get("user_id") != user_id:
+                    continue
+
+                row = dict(metric)
+                # The empty-string bucket holds unowned sessions. Report it as None.
+                if row.get("user_id") == "":
+                    row["user_id"] = None
+                filtered_metrics.append(row)
+
+                updated_at = metric.get("updated_at")
+                if updated_at and (latest_updated_at is None or updated_at > latest_updated_at):
+                    latest_updated_at = updated_at
+
+            if filtered_metrics and not self._deprecated_metrics_logged:
+                self._deprecated_metrics_logged = True
+                log_warning(
+                    f"{self.metrics_table_name} is no longer updated and is served until a first build; "
+                    "call calculate_metrics() once to build the new metrics tables."
+                )
+            return filtered_metrics, latest_updated_at
+
+        except Exception as e:
+            log_error(f"Exception getting metrics: {str(e)}")
+            raise e
+
+    def get_metrics_by_date(
+        self,
+        starting_date: Optional[date] = None,
+        ending_date: Optional[date] = None,
+    ) -> Tuple[List[dict], Optional[int]]:
+        """Get the metrics of every user, one row per day, matching the given date range.
+
+        Read from the everyone rows of the aggregate metrics file once the first calculate_metrics has finished, and
+        from the deprecated metrics file until then. A read never calculates them, as in get_metrics.
+
+        Args:
+            starting_date (Optional[date]): The starting date to filter metrics by.
+            ending_date (Optional[date]): The ending date to filter metrics by.
+
+        Returns:
+            Tuple[List[dict], Optional[int]]: A tuple containing the metrics and the timestamp of the latest update.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            if self._metrics_calculated():
+                return self._get_aggregate_metrics_rows(starting_date, ending_date, "")
+            return super().get_metrics_by_date(starting_date, ending_date)
+
+        except Exception as e:
+            log_error(f"Exception getting metrics: {str(e)}")
+            raise e
+
+    def get_metrics_refresh_status(self) -> Optional[Dict[str, Any]]:
+        """Get the status of the most recent calculate_metrics, from the metrics refreshes file.
+
+        Returns:
+            Optional[Dict[str, Any]]: The status ('running', 'completed' or 'failed'), when it started and finished,
+                and its error. None before the first calculation.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            return metrics_refresh_status(*self._get_metrics_refresh_row())
+
+        except Exception as e:
+            log_error(f"Exception getting metrics refresh status: {str(e)}")
+            raise e
+
+    def _get_component_metrics_totals_by_date(
+        self,
+        starting_date: date,
+        ending_date: date,
+        user_id: Optional[str],
+        fields: List[str],
+        use_month_rows: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        """Total the component metrics of the given date range, every day from one period.
+
+        Args:
+            starting_date (date): The first day to total.
+            ending_date (date): The last day to total.
+            user_id (Optional[str]): Total only this owner's rows. ``None`` totals every owner, ``""`` the runs with
+                no user.
+            fields (List[str]): The columns to total.
+            use_month_rows (bool): Total a calendar month inside the date range from its month aggregate metrics row, as
+                one date.
+
+        Returns:
+            Tuple[List[Dict[str, Any]], Optional[int]]: The totals of each date, and when they were last updated.
+        """
+        aggregate_metrics_rows = self._read_metrics_file(self.aggregate_metrics_table_name)
+        # Every owner is read from the everyone rows and a user from the user's rows; the runs with no user have no
+        # aggregate metrics row of their own, so they are read from their component rows
+        if user_id == "":
+            rows = [row for row in self._read_metrics_file(self.component_metrics_table_name) if row["user_id"] == ""]
+        else:
+            rows = [row for row in aggregate_metrics_rows if row["user_id"] == (user_id or "")]
+
+        # The component metrics file keeps day rows only, so the runs with no user are read day by day
+        full_months = metrics_full_months(starting_date, ending_date) if use_month_rows and user_id != "" else []
+        # Only a completed month's row stands for its days; an open one, reopened by a day rebuilt since or not
+        # yet built, is read from its days
+        month_starts = [
+            row["date"]
+            for row in aggregate_metrics_rows
+            if row["aggregation_period"] == "monthly"
+            and row["user_id"] == ""
+            and row["completed"]
+            and row["date"] in full_months
+        ]
+        return total_metrics_rows(rows, starting_date, ending_date, fields, month_starts=month_starts)
+
+    def get_component_metrics(
+        self,
+        starting_date: date,
+        ending_date: date,
+        user_id: Optional[str] = None,
+        fields: Optional[List[str]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        """Get the component metrics totals of each day in the given date range.
+
+        For every owner, each day is read from its everyone row; for one owner, from its rows. A read never calculates
+        them: calculate_metrics does.
+
+        Args:
+            starting_date (date): The first day to total.
+            ending_date (date): The last day to total.
+            user_id (Optional[str]): Total only this owner's rows. ``None`` totals every owner, ``""`` the runs with
+                no user.
+            fields (Optional[List[str]]): The columns to total. ``None`` totals all.
+
+        Returns:
+            Tuple[List[Dict[str, Any]], Optional[int]]: The totals of each day, and when they were last updated.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            fields = resolve_metrics_fields(fields)
+            metrics, latest_updated_at = self._get_component_metrics_totals_by_date(
+                starting_date, ending_date, user_id, fields
+            )
+            return [list_metrics_totals_models(day_totals) for day_totals in metrics], latest_updated_at
+
+        except Exception as e:
+            log_error(f"Exception getting component metrics: {str(e)}")
+            raise e
+
+    def get_metrics_totals(
+        self,
+        starting_date: date,
+        ending_date: date,
+        user_id: Optional[str] = None,
+        fields: Optional[List[str]] = None,
+    ) -> Tuple[Dict[str, Any], Optional[int]]:
+        """Get the component metrics totals of the whole given date range.
+
+        A calendar month inside the date range that has month rows is read from them, and every other day as
+        get_component_metrics reads it.
+
+        Args:
+            starting_date (date): The first day to total.
+            ending_date (date): The last day to total.
+            user_id (Optional[str]): Total only this owner's rows. ``None`` totals every owner, ``""`` the runs with
+                no user.
+            fields (Optional[List[str]]): The columns to total. ``None`` totals all.
+
+        Returns:
+            Tuple[Dict[str, Any], Optional[int]]: The totals of the date range, and when they were last updated.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            fields = resolve_metrics_fields(fields)
+            totals, latest_updated_at = self._get_component_metrics_totals_by_date(
+                starting_date, ending_date, user_id, fields, use_month_rows=True
+            )
+            return list_metrics_totals_models(merge_metrics_totals(totals, fields)), latest_updated_at
+
+        except Exception as e:
+            log_error(f"Exception getting metrics totals: {str(e)}")
+            raise e
+
+    def get_metrics_versions(self, starting_date: date, ending_date: date) -> Optional[Dict[str, int]]:
+        """Get the version of every everyone row of a day or a month of the aggregate metrics in the given date range.
+
+        A read never calculates them, as in get_metrics.
+
+        Args:
+            starting_date (date): The first day of the date range.
+            ending_date (date): The last day of the date range.
+
+        Returns:
+            Optional[Dict[str, int]]: The version of each everyone row, keyed by its aggregation period and date. The
+                same again only while no calculation wrote a row of the date range. ``None`` until the first
+                calculate_metrics has finished: a read would find no rows to total.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            if not self._metrics_calculated():
+                return None
+
+            return metrics_versions(
+                [
+                    SimpleNamespace(**row)
+                    for row in self._read_metrics_file(self.aggregate_metrics_table_name)
+                    if row["user_id"] == "" and starting_date <= row["date"] <= ending_date
+                ]
+            )
+
+        except Exception as e:
+            log_error(f"Exception getting metrics versions: {str(e)}")
+            raise e
+
+    # -- Knowledge methods --
+
+    @staticmethod
+    def _knowledge_item_is_visible(item: Dict[str, Any], user_id: Optional[str]) -> bool:
+        """Check if the given knowledge row is owned by the given user or unowned (shared)."""
+        if user_id is None:
+            return True
+        owner = item.get("user_id")
+        return owner is None or owner == user_id
+
+    def delete_knowledge_content(self, id: str, user_id: Optional[str] = None):
+        """Delete knowledge content by ID.
+
+        Args:
+            id (str): The ID of the knowledge row to delete.
+            user_id (Optional[str]): The ID of the user. If provided, only rows owned by that user are deleted.
+        """
+        try:
+            knowledge_items = self._read_json_file(self.knowledge_table_name)
+            knowledge_items = [
+                item
+                for item in knowledge_items
+                if not (item.get("id") == id and (user_id is None or item.get("user_id") == user_id))
+            ]
+            self._write_json_file(self.knowledge_table_name, knowledge_items)
+        except Exception as e:
+            log_warning(f"Error deleting knowledge content: {str(e)}")
+            raise e
+
+    def get_knowledge_content(self, id: str, user_id: Optional[str] = None) -> Optional[KnowledgeRow]:
+        """Get knowledge content by ID.
+
+        Args:
+            id (str): The ID of the knowledge row to get.
+            user_id (Optional[str]): The ID of the user. If provided, only their rows and unowned rows are visible.
+        """
+        try:
+            knowledge_items = self._read_json_file(self.knowledge_table_name)
+
+            for item in knowledge_items:
+                if item.get("id") == id and self._knowledge_item_is_visible(item, user_id):
+                    return KnowledgeRow.model_validate(item)
+
+            return None
+        except Exception as e:
+            log_warning(f"Error getting knowledge content: {str(e)}")
+            raise e
+
+    def get_knowledge_contents(
+        self,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        linked_to: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Tuple[List[KnowledgeRow], int]:
+        """Get all knowledge contents from the GCS JSON file.
+
+        Args:
+            limit (Optional[int]): The maximum number of knowledge contents to return.
+            page (Optional[int]): The page number.
+            sort_by (Optional[str]): The column to sort by.
+            sort_order (Optional[str]): The order to sort by.
+            linked_to (Optional[str]): Filter by linked_to value (knowledge instance name).
+            user_id (Optional[str]): The ID of the user. If provided, only their rows and unowned rows are returned.
+
+        Returns:
+            Tuple[List[KnowledgeRow], int]: The knowledge contents and total count.
+        """
+        try:
+            knowledge_items = self._read_json_file(self.knowledge_table_name)
+
+            # Apply linked_to filter if provided
+            if linked_to is not None:
+                knowledge_items = [item for item in knowledge_items if item.get("linked_to") == linked_to]
+
+            # Apply owner scoping if provided
+            if user_id is not None:
+                knowledge_items = [item for item in knowledge_items if self._knowledge_item_is_visible(item, user_id)]
+
+            total_count = len(knowledge_items)
+
+            # Apply sorting
+            knowledge_items = apply_sorting(knowledge_items, sort_by, sort_order)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                knowledge_items = knowledge_items[start_idx : start_idx + limit]
+
+            return [KnowledgeRow.model_validate(item) for item in knowledge_items], total_count
+
+        except Exception as e:
+            log_warning(f"Error getting knowledge contents: {str(e)}")
+            raise e
+
+    def upsert_knowledge_content(self, knowledge_row: KnowledgeRow):
+        """Upsert knowledge content in the GCS JSON file."""
+        try:
+            knowledge_items = self._read_json_file(self.knowledge_table_name, create_table_if_not_found=True)
+            knowledge_dict = knowledge_row.model_dump()
+
+            # Find existing item to update
+            item_updated = False
+            for i, existing_item in enumerate(knowledge_items):
+                if existing_item.get("id") == knowledge_row.id:
+                    # A scoped write must not overwrite an item it does not own
+                    if knowledge_row.user_id is not None and existing_item.get("user_id") != knowledge_row.user_id:
+                        raise ValueError(f"Knowledge content {knowledge_row.id} not found")
+                    knowledge_items[i] = knowledge_dict
+                    item_updated = True
+                    break
+
+            if not item_updated:
+                knowledge_items.append(knowledge_dict)
+
+            self._write_json_file(self.knowledge_table_name, knowledge_items)
+            return knowledge_row
+
+        except Exception as e:
+            log_warning(f"Error upserting knowledge row: {str(e)}")
+            raise e
+
+    # -- Eval methods --
+    def create_eval_run(self, eval_run: EvalRunRecord) -> Optional[EvalRunRecord]:
+        """Create an EvalRunRecord in the GCS JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name, create_table_if_not_found=True)
+
+            current_time = int(time.time())
+            eval_dict = eval_run.model_dump()
+            eval_dict["created_at"] = current_time
+            eval_dict["updated_at"] = current_time
+
+            eval_runs.append(eval_dict)
+            self._write_json_file(self.eval_table_name, eval_runs)
+
+            return eval_run
+        except Exception as e:
+            log_warning(f"Error creating eval run: {str(e)}")
+            raise e
+
+    def delete_eval_run(self, eval_run_id: str) -> None:
+        """Delete an eval run from the GCS JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+            original_count = len(eval_runs)
+            eval_runs = [run for run in eval_runs if run.get("run_id") != eval_run_id]
+
+            if len(eval_runs) < original_count:
+                self._write_json_file(self.eval_table_name, eval_runs)
+                log_debug(f"Deleted eval run with ID: {eval_run_id}")
+            else:
+                log_warning(f"No eval run found with ID: {eval_run_id}")
+        except Exception as e:
+            log_warning(f"Error deleting eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    def delete_eval_runs(self, eval_run_ids: List[str], user_id: Optional[str] = None) -> None:
+        """Delete multiple eval runs from the GCS JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+            original_count = len(eval_runs)
+            eval_runs = [
+                run
+                for run in eval_runs
+                if not (run.get("run_id") in eval_run_ids and (user_id is None or run.get("user_id") == user_id))
+            ]
+
+            deleted_count = original_count - len(eval_runs)
+            if deleted_count > 0:
+                self._write_json_file(self.eval_table_name, eval_runs)
+                log_debug(f"Deleted {deleted_count} eval runs")
+            else:
+                log_warning(f"No eval runs found with IDs: {eval_run_ids}")
+        except Exception as e:
+            log_warning(f"Error deleting eval runs {eval_run_ids}: {str(e)}")
+            raise e
+
+    def get_eval_run(
+        self, eval_run_id: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
+    ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
+        """Get an eval run from the GCS JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+
+            for run_data in eval_runs:
+                if run_data.get("run_id") == eval_run_id:
+                    if user_id is not None and run_data.get("user_id") != user_id:
+                        return None
+                    if not deserialize:
+                        return run_data
+                    return EvalRunRecord.model_validate(run_data)
+
+            return None
+        except Exception as e:
+            log_warning(f"Exception getting eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    def get_eval_runs(
+        self,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        filter_type: Optional[EvalFilterType] = None,
+        eval_type: Optional[List[EvalType]] = None,
+        deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
+    ) -> Union[List[EvalRunRecord], Tuple[List[Dict[str, Any]], int]]:
+        """Get all eval runs from the GCS JSON file with filtering and pagination."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+
+            # Apply filters
+            filtered_runs = []
+            for run_data in eval_runs:
+                if agent_id is not None and run_data.get("agent_id") != agent_id:
+                    continue
+                if team_id is not None and run_data.get("team_id") != team_id:
+                    continue
+                if workflow_id is not None and run_data.get("workflow_id") != workflow_id:
+                    continue
+                if model_id is not None and run_data.get("model_id") != model_id:
+                    continue
+                if user_id is not None and run_data.get("user_id") != user_id:
+                    continue
+                if eval_type is not None and len(eval_type) > 0:
+                    if run_data.get("eval_type") not in eval_type:
+                        continue
+                if filter_type is not None:
+                    if filter_type == EvalFilterType.AGENT and run_data.get("agent_id") is None:
+                        continue
+                    elif filter_type == EvalFilterType.TEAM and run_data.get("team_id") is None:
+                        continue
+                    elif filter_type == EvalFilterType.WORKFLOW and run_data.get("workflow_id") is None:
+                        continue
+
+                filtered_runs.append(run_data)
+
+            total_count = len(filtered_runs)
+
+            # Apply sorting (default by created_at desc)
+            if sort_by is None:
+                filtered_runs.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+            else:
+                filtered_runs = apply_sorting(filtered_runs, sort_by, sort_order)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                filtered_runs = filtered_runs[start_idx : start_idx + limit]
+
+            if not deserialize:
+                return filtered_runs, total_count
+
+            return [EvalRunRecord.model_validate(run) for run in filtered_runs]
+
+        except Exception as e:
+            log_warning(f"Exception getting eval runs: {str(e)}")
+            raise e
+
+    def rename_eval_run(
+        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
+    ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
+        """Rename an eval run in the GCS JSON file."""
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+
+            for i, run_data in enumerate(eval_runs):
+                if run_data.get("run_id") == eval_run_id:
+                    if user_id is not None and run_data.get("user_id") != user_id:
+                        return None
+                    run_data["name"] = name
+                    run_data["updated_at"] = int(time.time())
+                    eval_runs[i] = run_data
+                    self._write_json_file(self.eval_table_name, eval_runs)
+
+                    if not deserialize:
+                        return run_data
+                    return EvalRunRecord.model_validate(run_data)
+
+            return None
+        except Exception as e:
+            log_warning(f"Error renaming eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    def update_eval_run_user_id(self, eval_run_id: str, user_id: str) -> None:
+        """Set the owner (user_id) on an existing eval run.
+
+        Args:
+            eval_run_id (str): The ID of the eval run to update.
+            user_id (str): The owner to set.
+        """
+        try:
+            eval_runs = self._read_json_file(self.eval_table_name)
+            for i, run_data in enumerate(eval_runs):
+                if run_data.get("run_id") == eval_run_id:
+                    run_data["user_id"] = user_id
+                    eval_runs[i] = run_data
+                    self._write_json_file(self.eval_table_name, eval_runs)
+                    break
+
+        except Exception as e:
+            log_warning(f"Error setting owner on eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    # --- Traces ---
+    def upsert_trace(self, trace: "Trace") -> None:
+        """Create or update a single trace record in the database.
+
+        Args:
+            trace: The Trace object to store (one per trace_id).
+        """
+        try:
+            traces = self._read_json_file(self.trace_table_name, create_table_if_not_found=True)
+
+            # Check if trace exists
+            existing_idx = None
+            for i, existing in enumerate(traces):
+                if existing.get("trace_id") == trace.trace_id:
+                    existing_idx = i
+                    break
+
+            if existing_idx is not None:
+                existing = traces[existing_idx]
+
+                # workflow (level 3) > team (level 2) > agent (level 1) > child/unknown (level 0)
+                def get_component_level(workflow_id: Any, team_id: Any, agent_id: Any, name: str) -> int:
+                    is_root_name = ".run" in name or ".arun" in name
+                    if not is_root_name:
+                        return 0
+                    elif workflow_id:
+                        return 3
+                    elif team_id:
+                        return 2
+                    elif agent_id:
+                        return 1
+                    else:
+                        return 0
+
+                existing_level = get_component_level(
+                    existing.get("workflow_id"),
+                    existing.get("team_id"),
+                    existing.get("agent_id"),
+                    existing.get("name", ""),
+                )
+                new_level = get_component_level(trace.workflow_id, trace.team_id, trace.agent_id, trace.name)
+                should_update_name = new_level > existing_level
+
+                # Parse existing start_time to calculate correct duration
+                existing_start_time_str = existing.get("start_time")
+                if isinstance(existing_start_time_str, str):
+                    existing_start_time = datetime.fromisoformat(existing_start_time_str.replace("Z", "+00:00"))
+                else:
+                    existing_start_time = trace.start_time
+
+                recalculated_duration_ms = int((trace.end_time - existing_start_time).total_seconds() * 1000)
+
+                # Update existing trace
+                existing["end_time"] = trace.end_time.isoformat()
+                existing["duration_ms"] = recalculated_duration_ms
+                existing["status"] = trace.status
+                if should_update_name:
+                    existing["name"] = trace.name
+
+                # Preserve existing non-null context values: only fill in fields
+                # that the existing row left blank. Otherwise a later upsert from
+                # a child span (e.g. a post-hook agent's run with a different
+                # session_id) would overwrite the trace's already-correct context.
+                if existing.get("run_id") is None and trace.run_id is not None:
+                    existing["run_id"] = trace.run_id
+                if existing.get("session_id") is None and trace.session_id is not None:
+                    existing["session_id"] = trace.session_id
+                if existing.get("user_id") is None and trace.user_id is not None:
+                    existing["user_id"] = trace.user_id
+                if existing.get("agent_id") is None and trace.agent_id is not None:
+                    existing["agent_id"] = trace.agent_id
+                if existing.get("team_id") is None and trace.team_id is not None:
+                    existing["team_id"] = trace.team_id
+                if existing.get("workflow_id") is None and trace.workflow_id is not None:
+                    existing["workflow_id"] = trace.workflow_id
+
+                traces[existing_idx] = existing
+            else:
+                # Add new trace
+                trace_dict = trace.to_dict()
+                trace_dict.pop("total_spans", None)
+                trace_dict.pop("error_count", None)
+                traces.append(trace_dict)
+
+            self._write_json_file(self.trace_table_name, traces)
+
+        except Exception as e:
+            log_error(f"Error creating trace: {str(e)}")
+
+    def get_trace(
+        self,
+        trace_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ):
+        """Get a single trace by trace_id or other filters.
+
+        Args:
+            trace_id: The unique trace identifier.
+            run_id: Filter by run ID (returns first match).
+
+        Returns:
+            Optional[Trace]: The trace if found, None otherwise.
+
+        Note:
+            If multiple filters are provided, trace_id takes precedence.
+            For other filters, the most recent trace is returned.
+        """
+        try:
+            from agno.tracing.schemas import Trace
+
+            traces = self._read_json_file(self.trace_table_name, create_table_if_not_found=False)
+            if not traces:
+                return None
+
+            # Get spans for calculating total_spans and error_count
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=False)
+
+            # Filter traces
+            filtered = []
+            for t in traces:
+                if trace_id and t.get("trace_id") == trace_id:
+                    filtered.append(t)
+                    break
+                elif run_id and t.get("run_id") == run_id:
+                    filtered.append(t)
+
+            if not filtered:
+                return None
+
+            # Sort by start_time desc and get first
+            filtered.sort(key=lambda x: x.get("start_time", ""), reverse=True)
+            trace_data = filtered[0]
+
+            # Calculate total_spans and error_count
+            trace_spans = [s for s in spans if s.get("trace_id") == trace_data.get("trace_id")]
+            trace_data["total_spans"] = len(trace_spans)
+            trace_data["error_count"] = sum(1 for s in trace_spans if s.get("status_code") == "ERROR")
+
+            return Trace.from_dict(trace_data)
+
+        except Exception as e:
+            log_error(f"Error getting trace: {str(e)}")
+            return None
+
+    def get_traces(
+        self,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        status: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: Optional[int] = 20,
+        page: Optional[int] = 1,
+    ) -> tuple[List, int]:
+        """Get traces matching the provided filters with pagination.
+
+        Args:
+            run_id: Filter by run ID.
+            session_id: Filter by session ID.
+            user_id: Filter by user ID.
+            agent_id: Filter by agent ID.
+            team_id: Filter by team ID.
+            workflow_id: Filter by workflow ID.
+            status: Filter by status (OK, ERROR, UNSET).
+            start_time: Filter traces starting after this datetime.
+            end_time: Filter traces ending before this datetime.
+            limit: Maximum number of traces to return per page.
+            page: Page number (1-indexed).
+
+        Returns:
+            tuple[List[Trace], int]: Tuple of (list of matching traces, total count).
+        """
+        try:
+            from agno.tracing.schemas import Trace
+
+            traces = self._read_json_file(self.trace_table_name, create_table_if_not_found=False)
+            if not traces:
+                return [], 0
+
+            # Get spans for calculating total_spans and error_count
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=False)
+
+            # Apply filters
+            filtered = []
+            for t in traces:
+                if run_id and t.get("run_id") != run_id:
+                    continue
+                if session_id and t.get("session_id") != session_id:
+                    continue
+                if user_id and t.get("user_id") != user_id:
+                    continue
+                if agent_id and t.get("agent_id") != agent_id:
+                    continue
+                if team_id and t.get("team_id") != team_id:
+                    continue
+                if workflow_id and t.get("workflow_id") != workflow_id:
+                    continue
+                if status and t.get("status") != status:
+                    continue
+                if start_time:
+                    trace_start = t.get("start_time", "")
+                    if trace_start < start_time.isoformat():
+                        continue
+                if end_time:
+                    trace_end = t.get("end_time", "")
+                    if trace_end > end_time.isoformat():
+                        continue
+                filtered.append(t)
+
+            total_count = len(filtered)
+
+            # Sort by start_time desc
+            filtered.sort(key=lambda x: x.get("start_time", ""), reverse=True)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                filtered = filtered[start_idx : start_idx + limit]
+
+            # Add total_spans and error_count to each trace
+            result_traces = []
+            for t in filtered:
+                trace_spans = [s for s in spans if s.get("trace_id") == t.get("trace_id")]
+                t["total_spans"] = len(trace_spans)
+                t["error_count"] = sum(1 for s in trace_spans if s.get("status_code") == "ERROR")
+                result_traces.append(Trace.from_dict(t))
+
+            return result_traces, total_count
+
+        except Exception as e:
+            log_error(f"Error getting traces: {str(e)}")
+            return [], 0
+
+    def get_trace_stats(
+        self,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: Optional[int] = 20,
+        page: Optional[int] = 1,
+        group_by: Literal["session", "agent", "team", "workflow", "endpoint"] = "session",
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Get trace statistics grouped by session.
+
+        Args:
+            user_id: Filter by user ID.
+            agent_id: Filter by agent ID.
+            team_id: Filter by team ID.
+            workflow_id: Filter by workflow ID.
+            start_time: Filter sessions with traces created after this datetime.
+            end_time: Filter sessions with traces created before this datetime.
+            limit: Maximum number of sessions to return per page.
+            page: Page number (1-indexed).
+            group_by: Only the default "session" grouping is supported by this backend.
+
+        Returns:
+            tuple[List[Dict], int]: Tuple of (list of session stats dicts, total count).
+                Each dict contains: session_id, user_id, agent_id, team_id, workflow_id, total_traces,
+                first_trace_at, last_trace_at.
+        """
+        if group_by != "session":
+            raise NotImplementedError(
+                f"get_trace_stats with group_by={group_by!r} is not supported by {self.__class__.__name__}. "
+                "Only the default 'session' grouping is available."
+            )
+
+        try:
+            traces = self._read_json_file(self.trace_table_name, create_table_if_not_found=False)
+            if not traces:
+                return [], 0
+
+            # Group by session_id
+            session_stats: Dict[str, Dict[str, Any]] = {}
+
+            for t in traces:
+                trace_session_id = t.get("session_id")
+                if not trace_session_id:
+                    continue
+
+                # Apply filters
+                if user_id and t.get("user_id") != user_id:
+                    continue
+                if agent_id and t.get("agent_id") != agent_id:
+                    continue
+                if team_id and t.get("team_id") != team_id:
+                    continue
+                if workflow_id and t.get("workflow_id") != workflow_id:
+                    continue
+
+                created_at = t.get("created_at", "")
+                if start_time and created_at < start_time.isoformat():
+                    continue
+                if end_time and created_at > end_time.isoformat():
+                    continue
+
+                if trace_session_id not in session_stats:
+                    session_stats[trace_session_id] = {
+                        "session_id": trace_session_id,
+                        "user_id": t.get("user_id"),
+                        "agent_id": t.get("agent_id"),
+                        "team_id": t.get("team_id"),
+                        "workflow_id": t.get("workflow_id"),
+                        "total_traces": 0,
+                        "first_trace_at": created_at,
+                        "last_trace_at": created_at,
+                    }
+
+                session_stats[trace_session_id]["total_traces"] += 1
+                if created_at and session_stats[trace_session_id]["first_trace_at"]:
+                    if created_at < session_stats[trace_session_id]["first_trace_at"]:
+                        session_stats[trace_session_id]["first_trace_at"] = created_at
+                if created_at and session_stats[trace_session_id]["last_trace_at"]:
+                    if created_at > session_stats[trace_session_id]["last_trace_at"]:
+                        session_stats[trace_session_id]["last_trace_at"] = created_at
+
+            stats_list = list(session_stats.values())
+            total_count = len(stats_list)
+
+            # Sort by last_trace_at desc
+            stats_list.sort(key=lambda x: x.get("last_trace_at", ""), reverse=True)
+
+            # Apply pagination
+            if limit is not None:
+                start_idx = 0
+                if page is not None:
+                    start_idx = (page - 1) * limit
+                stats_list = stats_list[start_idx : start_idx + limit]
+
+            # Convert ISO strings to datetime objects
+            for stat in stats_list:
+                first_at = stat.get("first_trace_at", "")
+                last_at = stat.get("last_trace_at", "")
+                if first_at:
+                    stat["first_trace_at"] = datetime.fromisoformat(first_at.replace("Z", "+00:00"))
+                if last_at:
+                    stat["last_trace_at"] = datetime.fromisoformat(last_at.replace("Z", "+00:00"))
+
+            return stats_list, total_count
+
+        except Exception as e:
+            log_error(f"Error getting trace stats: {str(e)}")
+            return [], 0
+
+    # --- Spans ---
+    def create_span(self, span: "Span") -> None:
+        """Create a single span in the database.
+
+        Args:
+            span: The Span object to store.
+        """
+        try:
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=True)
+            spans.append(span.to_dict())
+            self._write_json_file(self.span_table_name, spans)
+
+        except Exception as e:
+            log_error(f"Error creating span: {str(e)}")
+
+    def create_spans(self, spans: List) -> None:
+        """Create multiple spans in the database as a batch.
+
+        Args:
+            spans: List of Span objects to store.
+        """
+        if not spans:
+            return
+
+        try:
+            existing_spans = self._read_json_file(self.span_table_name, create_table_if_not_found=True)
+            for span in spans:
+                existing_spans.append(span.to_dict())
+            self._write_json_file(self.span_table_name, existing_spans)
+
+        except Exception as e:
+            log_error(f"Error creating spans batch: {str(e)}")
+
+    def get_span(self, span_id: str):
+        """Get a single span by its span_id.
+
+        Args:
+            span_id: The unique span identifier.
+
+        Returns:
+            Optional[Span]: The span if found, None otherwise.
+        """
+        try:
+            from agno.tracing.schemas import Span
+
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=False)
+
+            for s in spans:
+                if s.get("span_id") == span_id:
+                    return Span.from_dict(s)
+
+            return None
+
+        except Exception as e:
+            log_error(f"Error getting span: {str(e)}")
+            return None
+
+    def get_spans(
+        self,
+        trace_id: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+        limit: Optional[int] = 1000,
+    ) -> List:
+        """Get spans matching the provided filters.
+
+        Args:
+            trace_id: Filter by trace ID.
+            parent_span_id: Filter by parent span ID.
+            limit: Maximum number of spans to return.
+
+        Returns:
+            List[Span]: List of matching spans.
+        """
+        try:
+            from agno.tracing.schemas import Span
+
+            spans = self._read_json_file(self.span_table_name, create_table_if_not_found=False)
+            if not spans:
+                return []
+
+            # Apply filters
+            filtered = []
+            for s in spans:
+                if trace_id and s.get("trace_id") != trace_id:
+                    continue
+                if parent_span_id and s.get("parent_span_id") != parent_span_id:
+                    continue
+                filtered.append(s)
+
+            # Apply limit
+            if limit:
+                filtered = filtered[:limit]
+
+            return [Span.from_dict(s) for s in filtered]
+
+        except Exception as e:
+            log_error(f"Error getting spans: {str(e)}")
+            return []
+
+    # -- Learning methods (stubs) --
+    def get_learning(
+        self,
+        learning_type: str,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError("Learning methods not yet implemented for GcsJsonDb")
+
+    def upsert_learning(
+        self,
+        id: str,
+        learning_type: str,
+        content: Dict[str, Any],
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        raise NotImplementedError("Learning methods not yet implemented for GcsJsonDb")
+
+    def delete_learning(self, id: str) -> bool:
+        raise NotImplementedError("Learning methods not yet implemented for GcsJsonDb")
+
+    def get_learnings(
+        self,
+        learning_type: Optional[str] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError("Learning methods not yet implemented for GcsJsonDb")
