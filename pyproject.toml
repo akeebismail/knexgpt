@@ -2,6 +2,8 @@
 name = "knexgpt"
 version = "0.1.0"
 description = "Multi-agent knowledge graph system with AI-driven querying and data processing"
+license = "Apache-2.0"
+authors = ["Your Name <your.email@example.com>"]
 authors = ["Your Name <[REDACTED_EMAIL]>"]
 
 [tool.poetry.dependencies]
