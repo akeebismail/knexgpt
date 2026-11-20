@@ -64,20 +64,6 @@ Across the flow: provenance · change tracking · versioning · access rules
 
 Storage and indexing should be implementation choices, not requirements imposed on every consumer. Optional retrieval indexes can help applications search the managed data.
 
-## What is in the repository today?
-
-| Area | Existing code | Status |
-| --- | --- | --- |
-| Knowledge abstractions | `knexgpt/knowledge/knowledge.py`, `content.py`, `protocol.py`, `document/` | Imported Agno Knowledge source; not verified as an independent KnexGPT package |
-| Source readers and loaders | `knexgpt/knowledge/reader/`, `loaders/`, `remote_content/` | Source code for several kinds of content; imports and provider dependencies still need work |
-| Content representations | `knexgpt/knowledge/chunking/`, `embedder/` | Chunking and embedding code exists as imported source; no verified integrated processing pipeline |
-| Retrieval helpers | `knexgpt/knowledge/reranker/`, `query_transformer/` | Imported helper implementations; no validated end-to-end search or query service |
-| Storage adapters | `knexgpt/vendor/agno/db/`, `vectordb/` | Vendored Agno source; not a supported KnexGPT storage deployment |
-| Earlier experiments | `knexgpt/api/`, `agents/`, `db/`, `parser/`, `messaging/` | Legacy prototypes; they do not form a supported application |
-| Source registry, metadata governance, and lifecycle | No integrated service | Planned work; not implemented |
-
-**About the AI-related code:** The repository includes imported embedding, vector database, and reranking implementations, as well as legacy agent experiments. These are part of the repository's history and current source tree; they are **not** a verified KnexGPT model-serving or context-delivery service. Embeddings, where used, are numerical representations for indexing and similarity search. That is different from an API sending embeddings to an LLM. No end-to-end delivery path is currently validated.
-
 ## Source layout
 
 ~~~text
@@ -117,6 +103,7 @@ The design should be useful to ordinary data-driven applications without requiri
 KnexGPT is **not yet a runnable, end-to-end data-management service**.
 
 - The imported Knowledge snapshot still contains `agno.*` imports and dependencies on modules outside the copied source. The included modules are not yet independently importable and tested.
+- Existing imported embedding, vector database, and reranking code and legacy agent experiments are not part of a verified end-to-end AI or context-delivery service.
 - The legacy `POST /query` endpoint uses mocked context and is not a supported data-query interface.
 - A working source registry, governed lifecycle, reliable refresh/version handling, and a consistent public data-access API have not been implemented.
 - `pyproject.toml` does not yet cover all dependencies required by the imported Knowledge code.
